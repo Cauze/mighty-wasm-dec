@@ -1,0 +1,34 @@
+# Woodpecker pipeline: build the C corpus to standalone wasm with Emscripten.
+#
+# Run from the project root (mighty-wasm-dec):
+#   woodpecker-cli exec --backend-engine docker .woodpecker/corpus.yml
+#
+# NOTE: --backend-engine docker is required. The default is the local
+# backend, which would try to run emcc on Windows instead of in the
+# emscripten image.
+when:
+  event: manual
+
+steps:
+  build-corpus:
+    image: emscripten/emsdk:4.0.10
+    commands:
+      - emcc --version
+      - mkdir -p corpus/wasm
+      - |
+        for f in fac struct call indirect strings switch globals array float intops conv memory control recursion; do
+          echo "== $f =="
+          emcc "corpus/src/$f.c" -O1 -g \
+            -s STANDALONE_WASM=1 \
+            -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
+            -o "corpus/wasm/$f.wasm"
+        done
+      - |
+        echo "== simd (-msimd128) =="
+        emcc corpus/src/simd.c -O1 -g -msimd128 \
+          -s STANDALONE_WASM=1 \
+          -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
+          -o corpus/wasm/simd.wasm
+      - ls -la corpus/wasm
+      - emcc --version > corpus/wasm/BUILD.txt
+      - 'echo "flags: -O1 -g -s STANDALONE_WASM=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0" >> corpus/wasm/BUILD.txt'

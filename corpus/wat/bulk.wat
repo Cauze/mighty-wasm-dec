@@ -1,0 +1,16 @@
+;; Bulk memory + bulk table shapes.
+(module
+  (memory 1)
+  (table 4 funcref)
+  (data $d "0123456789abcdef")
+  (elem $e func 0)
+  (func (export "bcopy") (param i32 i32 i32)
+    (memory.copy (local.get 0) (local.get 1) (local.get 2)))
+  (func (export "bfill") (param i32 i32 i32)
+    (memory.fill (local.get 0) (local.get 1) (local.get 2)))
+  (func (export "binit") (param i32 i32 i32)
+    (memory.init $d (local.get 0) (local.get 1) (local.get 2)))
+  (func (export "bdrop")
+    (data.drop $d))
+  (func (export "tcopy") (param i32 i32 i32)
+    (table.copy (local.get 0) (local.get 1) (local.get 2))))

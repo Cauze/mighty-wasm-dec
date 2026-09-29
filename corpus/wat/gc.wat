@@ -1,0 +1,18 @@
+;; GC: structs, arrays, i31, casts.
+(module
+  (type $pt (struct (field $x i32) (field $y (mut i32))))
+  (type $ai (array (mut i32)))
+  (func (export "mkpt") (param i32 i32) (result (ref $pt))
+    (struct.new $pt (local.get 0) (local.get 1)))
+  (func (export "getx") (param (ref $pt)) (result i32)
+    (struct.get $pt $x (local.get 0)))
+  (func (export "sety") (param (ref $pt) i32)
+    (struct.set $pt $y (local.get 0) (local.get 1)))
+  (func (export "mkarr") (param i32 i32) (result (ref $ai))
+    (array.new $ai (local.get 0) (local.get 1)))
+  (func (export "arrlen") (param (ref $ai)) (result i32)
+    (array.len (local.get 0)))
+  (func (export "i31") (param i32) (result i32)
+    (i31.get_s (ref.i31 (local.get 0))))
+  (func (export "testc") (param (ref $pt)) (result i32)
+    (ref.test (ref $pt) (local.get 0))))

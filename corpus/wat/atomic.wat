@@ -1,0 +1,17 @@
+;; Threads/atomics shape coverage. Shared memory required.
+(module
+  (memory 1 1 shared)
+  (func (export "aload") (param i32) (result i32)
+    (i32.atomic.load (local.get 0)))
+  (func (export "astore") (param i32 i32)
+    (i32.atomic.store (local.get 0) (local.get 1)))
+  (func (export "aadd") (param i32 i32) (result i32)
+    (i32.atomic.rmw.add (local.get 0) (local.get 1)))
+  (func (export "acmp") (param i32 i32 i32) (result i32)
+    (i32.atomic.rmw.cmpxchg (local.get 0) (local.get 1) (local.get 2)))
+  (func (export "afence")
+    (atomic.fence))
+  (func (export "await") (param i32 i32 i64) (result i32)
+    (memory.atomic.wait32 (local.get 0) (local.get 1) (local.get 2)))
+  (func (export "anotify") (param i32 i32) (result i32)
+    (memory.atomic.notify (local.get 0) (local.get 1))))
