@@ -1,10 +1,5 @@
 #![allow(dead_code)]
-mod emit;
-mod ir;
-mod lift;
-mod parse;
-mod passes;
-mod types;
+use mighty_wasm_dec::{emit, lift, parse, passes, types};
 
 use anyhow::{Context, Result};
 use clap::Parser;

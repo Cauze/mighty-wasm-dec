@@ -105,7 +105,6 @@ fn str_by_addr(strings: &[StrEntry], addr: u64) -> Option<&StrEntry> {
 
 struct EmitCtx<'a> {
     layouts: &'a HashMap<String, (String, u64, u8)>,
-    data: &'a [DataSeg],
     /// (start, end, seg idx) sorted by start, built once (perf R3).
     data_bounds: &'a [(u64, u64, u32)],
     strings: &'a [StrEntry],
@@ -1188,7 +1187,6 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
         collect_ref_labels(&f.body, &mut ref_labels);
         let ctx = EmitCtx {
             layouts: &layouts,
-            data: &m.data,
             data_bounds: &data_bounds,
             strings: &strings,
             mode: cfg.strings,

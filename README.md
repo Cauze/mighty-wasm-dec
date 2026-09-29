@@ -55,6 +55,34 @@ empty stubs — use `--order=calls` + `--func-name` to navigate those.
 * Synthetic `tN` are `int32_t` heuristic; widths/signedness not C-correct yet.
 * Output is readable pseudo-C; recompilability is not a goal.
 
+## Using as a library
+
+The crate exposes its pipeline (`parse` → `lift` → `passes` → `emit`)
+for writing your own deobfuscation/optimization passes:
+
+```toml
+mighty-wasm-dec = { git = "https://github.com/Cauze/mighty-wasm-dec.git" }
+```
+
+```rust
+use mighty_wasm_dec::{emit, lift, parse, passes};
+use passes::{FuncPass, PassCtx};
+
+// ... implement FuncPass for your pass ...
+let mut meta = parse::parse_meta(&bytes)?;
+let mut mir = lift::lift_module(&bytes, &mut meta)?;
+let mut ctx = PassCtx::default();
+for f in mir.funcs.iter_mut() {
+    passes::optimize_func(f);
+    my_pass.run(f, &mut ctx);
+}
+print!("{}", emit::emit_c(&mir));
+```
+
+See `examples/const_on_right.rs` (commutative canonicalization) and
+`docs/LIB_REFACTOR.md` for the pass-author toolkit
+(`count_uses_stmts`, `collect_def_use_seq`, `subst_all_in_stmts`, …).
+
 ## Corpus
 
 Real Emscripten builds live in `corpus/` (see `corpus/README.md`):

@@ -45,32 +45,105 @@ pub fn optimize_func(f: &mut FuncIR) {
 /// Only populated for simple (Local) replacements.
 pub type AliasMap = HashMap<String, String>;
 
-pub fn optimize_func_with(f: &mut FuncIR, opt: &OptConfig) -> AliasMap {
-    let mut aliases = HashMap::new();
-    if !opt.fold && !opt.inline && !opt.dce && !opt.simplify {
-        return aliases;
+/// Shared per-function state for passes. Passes that discover renames
+/// (copyprop) record them here so later passes and the emitter agree.
+#[derive(Debug, Default)]
+pub struct PassCtx {
+    pub aliases: AliasMap,
+}
+
+/// A single function pass. `run` returns true if it changed the function.
+/// Implement this to write your own deobfuscation/optimization pass —
+/// see `examples/const_on_right.rs`.
+pub trait FuncPass {
+    fn name(&self) -> &'static str;
+    fn run(&self, f: &mut FuncIR, ctx: &mut PassCtx) -> bool;
+}
+
+/// Constant folding + const-branch pruning.
+pub struct FoldPass;
+/// Single-use tmp/local inlining + dead-code elimination.
+pub struct InlineDcePass {
+    pub inline: bool,
+    pub dce: bool,
+}
+/// Empty-block removal + pass-through flattening.
+pub struct SimplifyPass;
+/// Packed-i64-init splitting (needs i32 evidence; gated with folding).
+pub struct SplitInitPass;
+
+impl FuncPass for FoldPass {
+    fn name(&self) -> &'static str {
+        "fold"
     }
+    fn run(&self, f: &mut FuncIR, _ctx: &mut PassCtx) -> bool {
+        fold_stmts_inplace(&mut f.body)
+    }
+}
+
+impl FuncPass for InlineDcePass {
+    fn name(&self) -> &'static str {
+        "inline-dce"
+    }
+    fn run(&self, f: &mut FuncIR, ctx: &mut PassCtx) -> bool {
+        let opt = OptConfig {
+            fold: false,
+            inline: self.inline,
+            dce: self.dce,
+            simplify: false,
+        };
+        inline_and_dce(&mut f.body, &opt, &mut ctx.aliases)
+    }
+}
+
+impl FuncPass for SimplifyPass {
+    fn name(&self) -> &'static str {
+        "simplify"
+    }
+    fn run(&self, f: &mut FuncIR, _ctx: &mut PassCtx) -> bool {
+        simplify_blocks(&mut f.body)
+    }
+}
+
+impl FuncPass for SplitInitPass {
+    fn name(&self) -> &'static str {
+        "split-init"
+    }
+    fn run(&self, f: &mut FuncIR, _ctx: &mut PassCtx) -> bool {
+        split_init_stores(f)
+    }
+}
+
+pub fn optimize_func_with(f: &mut FuncIR, opt: &OptConfig) -> AliasMap {
+    let mut ctx = PassCtx::default();
+    if !opt.fold && !opt.inline && !opt.dce && !opt.simplify {
+        return ctx.aliases;
+    }
+    let fold = FoldPass;
+    let inline = InlineDcePass { inline: opt.inline, dce: opt.dce };
+    let simp = SimplifyPass;
+    let split = SplitInitPass;
     for _ in 0..2 {
         let mut changed = false;
         if opt.fold {
-            changed |= fold_stmts_inplace(&mut f.body);
+            changed |= fold.run(f, &mut ctx);
         }
         if opt.inline || opt.dce {
-            changed |= inline_and_dce(&mut f.body, opt, &mut aliases);
+            changed |= inline.run(f, &mut ctx);
         }
         if !changed {
             break;
         }
     }
     if opt.simplify {
-        simplify_blocks(&mut f.body);
+        simp.run(f, &mut ctx);
     }
     if opt.fold {
         // i64-init split is a value rewrite; gated with folding.
-        split_init_stores(f);
+        split.run(f, &mut ctx);
     }
-    f.aliases = aliases.clone();
-    aliases
+    f.aliases = ctx.aliases.clone();
+    ctx.aliases
 }
 
 
@@ -92,7 +165,8 @@ fn simd_has_effect(op: &str) -> bool {
         || op.starts_with("array.init")
 }
 
-fn is_pure(e: &Expr) -> bool {    match e {
+/// True if evaluating `e` has no observable effect (safe to duplicate/eliminate)
+ pub fn is_pure(e: &Expr) -> bool {    match e {
         Expr::ConstI32(_)
         | Expr::ConstI64(_)
         | Expr::ConstF32(_)
@@ -107,7 +181,8 @@ fn is_pure(e: &Expr) -> bool {    match e {
     }
 }
 
-fn expr_depth(e: &Expr) -> usize {
+/// Expression-tree depth (inlining budget heuristic)
+ pub fn expr_depth(e: &Expr) -> usize {
     match e {
         Expr::Binop { lhs, rhs, .. } => 1 + expr_depth(lhs).max(expr_depth(rhs)),
         Expr::Unop { v, .. } => 1 + expr_depth(v),
@@ -400,7 +475,8 @@ fn count_uses_expr(e: &Expr, map: &mut HashMap<String, usize>) {
     }
 }
 
-fn count_uses_stmts(stmts: &[Stmt], map: &mut HashMap<String, usize>) {
+/// Count `lN`/`tN` mentions per statement list (pass-author toolkit)
+ pub fn count_uses_stmts(stmts: &[Stmt], map: &mut HashMap<String, usize>) {
     for s in stmts {
         match s {
             Stmt::Assign { expr, .. } => count_uses_expr(expr, map),
@@ -495,7 +571,8 @@ fn dce_list(stmts: &mut Vec<Stmt>, uses: &HashMap<String, usize>) -> bool {
     changed
 }
 
-fn rep_var_names(e: &Expr, acc: &mut Vec<String>) {
+/// Variable names mentioned in `e` (pass-author toolkit)
+ pub fn rep_var_names(e: &Expr, acc: &mut Vec<String>) {
     match e {
         Expr::Local(i) => acc.push(format!("l{i}")),
         Expr::Tmp(i) => acc.push(format!("t{i}")),
@@ -568,7 +645,8 @@ fn collect_seq_expr(e: &Expr, seq: usize, uses: &mut HashMap<String, Vec<usize>>
     }
 }
 
-fn collect_def_use_seq(
+/// Pre-order def/use statement sequence numbers (staleness checks).
+pub fn collect_def_use_seq(
     stmts: &[Stmt],
     seq: &mut usize,
     defs: &mut HashMap<String, Vec<usize>>,
@@ -664,7 +742,8 @@ fn subst_all_in_expr(e: &mut Expr, map: &HashMap<String, Expr>, hit: &mut HashSe
     }
 }
 
-fn subst_all_in_stmts(
+/// Substitute every name in `map` in one walk; records hits (pass-author toolkit)
+ pub fn subst_all_in_stmts(
     stmts: &mut [Stmt],
     map: &HashMap<String, Expr>,
     hit: &mut HashSet<String>,
@@ -701,7 +780,8 @@ fn subst_all_in_stmts(
 
 /// Remove all dead `name = ...` assigns in one sweep (perf: single O(n)
 /// pass instead of one O(n) `Vec::remove` memmove per variable).
-fn sweep_assigns(stmts: &mut Vec<Stmt>, dead: &HashSet<String>) -> bool {
+/// Remove all `name = ...` assigns in `dead` in one sweep.
+pub fn sweep_assigns(stmts: &mut Vec<Stmt>, dead: &HashSet<String>) -> bool {
     let mut changed = false;
     for s in stmts.iter_mut() {
         match s {
@@ -869,18 +949,21 @@ fn collect_labels(stmts: &[Stmt], set: &mut HashSet<String>) {
     }
 }
 
-fn simplify_blocks(stmts: &mut Vec<Stmt>) {
+fn simplify_blocks(stmts: &mut Vec<Stmt>) -> bool {
     let mut labels = HashSet::new();
     collect_labels(stmts, &mut labels);
     // fixpoint: flattening pass-through chains exposes more empties.
     // `simplify_list` reports whether it changed anything, so this is one
     // walk per round instead of two full count walks per round (perf R8);
     // the bound is on real progress, not a flat 10000 iterations.
+    let mut changed = false;
     for _ in 0..1000 {
         if !simplify_list(stmts, &labels) {
             break;
         }
+        changed = true;
     }
+    changed
 }
 
 fn simplify_list(stmts: &mut Vec<Stmt>, labels: &HashSet<String>) -> bool {
@@ -959,7 +1042,7 @@ fn simplify_list(stmts: &mut Vec<Stmt>, labels: &HashSet<String>) -> bool {
 
 // ---------- struct-init split ----------
 
-fn split_init_stores(f: &mut FuncIR) {
+fn split_init_stores(f: &mut FuncIR) -> bool {
     // offsets with ANY i32 (4-byte) access evidence (raw accesses, not merged
     // widths: the i64 store itself would otherwise widen the field to 8).
     let mut i32_offs: HashMap<String, HashSet<u64>> = HashMap::new();
@@ -975,9 +1058,9 @@ fn split_init_stores(f: &mut FuncIR) {
         }
     }
     if i32_offs.is_empty() {
-        return;
+        return false;
     }
-    split_in_list(&mut f.body, &i32_offs);
+    split_in_list(&mut f.body, &i32_offs)
 }
 
 fn base_key(e: &Expr) -> Option<String> {
@@ -989,15 +1072,18 @@ fn base_key(e: &Expr) -> Option<String> {
     }
 }
 
-fn split_in_list(stmts: &mut Vec<Stmt>, fields: &HashMap<String, HashSet<u64>>) {
+fn split_in_list(stmts: &mut Vec<Stmt>, fields: &HashMap<String, HashSet<u64>>) -> bool {
+    let mut changed = false;
     let mut i = 0;
     while i < stmts.len() {
         match &mut stmts[i] {
             Stmt::If { then_b, else_b, .. } => {
-                split_in_list(then_b, fields);
-                split_in_list(else_b, fields);
+                changed |= split_in_list(then_b, fields);
+                changed |= split_in_list(else_b, fields);
             }
-            Stmt::Block { body, .. } | Stmt::Loop { body, .. } => split_in_list(body, fields),
+            Stmt::Block { body, .. } | Stmt::Loop { body, .. } => {
+                changed |= split_in_list(body, fields)
+            }
             _ => {}
         }
         let replacement = match &stmts[i] {
@@ -1040,8 +1126,10 @@ fn split_in_list(stmts: &mut Vec<Stmt>, fields: &HashMap<String, HashSet<u64>>) 
             let n = stmts2.len();
             stmts.splice(i..i + 1, stmts2);
             i += n;
+            changed = true;
         } else {
             i += 1;
         }
     }
+    changed
 }
