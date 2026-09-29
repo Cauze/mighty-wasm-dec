@@ -14,6 +14,14 @@ struct Frame {
     in_else: bool,
     entry_depth: usize,
     results: usize, // block result arity (0/1 supported)
+    /// Merge tmp for `br`-carried block results (Block with results==1).
+    /// `br`/`br_if`/`br_table` targeting this frame assign the carried
+    /// value here; `End` merges the fallthrough value the same way.
+    /// (Loops need none: `br`-to-loop carries params, i.e. 0 for MVP.)
+    phi: Option<u32>,
+    /// Set when any branch assigned `phi` (so a diverged fallthrough can
+    /// still yield the branch value instead of an Unknown pad).
+    phi_assigned: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -39,6 +47,7 @@ fn cur_stmts<'a>(frames: &'a mut Vec<Frame>, top: &'a mut Vec<Stmt>) -> &'a mut 
 
 /// Best-effort wat-style mnemonic for honest fallback rendering:
 /// `I8x16Add` -> `i8x16.add`, `MemoryAtomicWait32` -> `memory.atomic.wait32`.
+/// Only used on generic-fallback (SIMD/atomic/GC) paths, not hot MVP ops.
 fn op_mnemonic(op: &Operator) -> String {
     let dbg = format!("{op:?}");
     let name = dbg.split([' ', '{', '(']).next().unwrap_or("unknown");
@@ -161,7 +170,7 @@ fn base_desc(e: &Expr) -> String {
     "expr".to_string()
 }
 
-pub fn lift_module(bytes: &[u8], meta: &ModuleMeta) -> Result<ModuleIR> {
+pub fn lift_module(bytes: &[u8], meta: &mut ModuleMeta) -> Result<ModuleIR> {
     let bodies = collect_bodies(bytes)?;
     let import_funcs = meta.import_func_count;
     let wanted: Vec<u32> = (0..bodies.len())
@@ -182,7 +191,7 @@ pub fn lift_module(bytes: &[u8], meta: &ModuleMeta) -> Result<ModuleIR> {
 /// Call/table metadata still comes from the full module meta.
 pub fn lift_selected(
     bodies: &[FunctionBody],
-    meta: &ModuleMeta,
+    meta: &mut ModuleMeta,
     wanted: &[u32],
 ) -> Result<ModuleIR> {
     let import_funcs = meta.import_func_count;
@@ -208,20 +217,17 @@ pub fn collect_bodies(bytes: &[u8]) -> Result<Vec<FunctionBody<'_>>> {
     Ok(bodies)
 }
 
-fn finish_module(meta: &ModuleMeta, funcs: Vec<FuncIR>) -> Result<ModuleIR> {
+fn finish_module(meta: &mut ModuleMeta, funcs: Vec<FuncIR>) -> Result<ModuleIR> {
     Ok(ModuleIR {
         funcs,
         tables: meta.tables.clone(),
         memories: meta.memories,
-        data: meta
-            .data
-            .iter()
+        // Move (don't clone) data bytes out of meta (perf R6): the old
+        // `b.clone()` kept full rodata resident 2× (meta + ModuleIR).
+        data: std::mem::take(&mut meta.data)
+            .into_iter()
             .enumerate()
-            .map(|(i, (off, b))| crate::ir::DataSeg {
-                idx: i as u32,
-                offset: *off,
-                bytes: b.clone(),
-            })
+            .map(|(i, (off, b))| crate::ir::DataSeg { idx: i as u32, offset: off, bytes: b })
             .collect(),
         globals: meta
             .globals
@@ -331,6 +337,14 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
             Operator::Block { blockty } => {
                 let r = block_results(&blockty);
                 label_seq += 1;
+                // Result-carrying blocks merge `br` values through a phi tmp.
+                let phi = if r == 1 {
+                    let t = tmp;
+                    tmp += 1;
+                    Some(t)
+                } else {
+                    None
+                };
                 frames.push(Frame {
                     kind: FrameKind::Block,
                     label: format!("B{label_seq}"),
@@ -339,6 +353,8 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     in_else: false,
                     entry_depth: stack.len(),
                     results: r,
+                    phi,
+                    phi_assigned: false,
                 });
                 if r > 1 {
                     cur_stmts(&mut frames, &mut top).push(Stmt::Comment(
@@ -357,6 +373,10 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     in_else: false,
                     entry_depth: stack.len(),
                     results: r,
+                    // No phi: br-to-loop carries params (0 for MVP);
+                    // the loop result comes from fallthrough at End.
+                    phi: None,
+                    phi_assigned: false,
                 });
             }
             Operator::If { blockty } => {
@@ -371,6 +391,9 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     in_else: false,
                     entry_depth: stack.len(),
                     results: r,
+                    // If-results use the then_results merge at End, not phi.
+                    phi: None,
+                    phi_assigned: false,
                 });
                 // stash cond for End handling
                 cond_stack.push(cond);
@@ -401,14 +424,48 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                 };
                 let stmt = match f.kind {
                     FrameKind::Block => {
-                        // Diverged bodies (unreachable on all paths, or br-carried
-                        // values we truncate) leave no result: pad honestly.
-                        while stack.len() < f.entry_depth + f.results.min(1) {
-                            stack.push(Expr::Unknown("diverged-block-result".into()));
-                        }
-                        Stmt::Block {
-                            label: f.label,
-                            body: f.then_stmts,
+                        // Merge `br`-carried + fallthrough values through phi:
+                        // every incoming edge assigned t<phi>; the fallthrough
+                        // assigns it here; End pushes the merged tmp.
+                        if f.results == 1 {
+                            if let Some(p) = f.phi {
+                                if stack.len() > f.entry_depth {
+                                    let fall = pop_or_unknown(&mut stack);
+                                    while stack.len() > f.entry_depth {
+                                        stack.pop();
+                                    }
+                                    let mut body = f.then_stmts;
+                                    body.push(Stmt::Assign {
+                                        dst: format!("t{p}"),
+                                        expr: fall,
+                                    });
+                                    stack.push(Expr::Tmp(p));
+                                    Stmt::Block { label: f.label, body }
+                                } else if f.phi_assigned {
+                                    stack.push(Expr::Tmp(p));
+                                    Stmt::Block { label: f.label, body: f.then_stmts }
+                                } else {
+                                    // Diverged bodies (unreachable on all paths)
+                                    // leave no result: pad honestly.
+                                    while stack.len() < f.entry_depth + 1 {
+                                        stack.push(Expr::Unknown("diverged-block-result".into()));
+                                    }
+                                    Stmt::Block { label: f.label, body: f.then_stmts }
+                                }
+                            } else {
+                                // results>1 (multi-value): only first modeled.
+                                while stack.len() < f.entry_depth + 1 {
+                                    stack.push(Expr::Unknown("diverged-block-result".into()));
+                                }
+                                Stmt::Block { label: f.label, body: f.then_stmts }
+                            }
+                        } else {
+                            // No result: leave the stack as-is (balanced code
+                            // is exactly at entry depth here).
+                            Stmt::Block {
+                                label: f.label,
+                                body: f.then_stmts,
+                            }
                         }
                     }
                     FrameKind::Try => {
@@ -511,6 +568,33 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
             }
             Operator::Br { relative_depth } => {
                 let (label, is_loop, _) = resolve_target(&frames, relative_depth);
+                if label == "func_end" {
+                    // Top-level `br` exits the function: lower to return.
+                    let mut vals = Vec::new();
+                    for _ in 0..results.len() {
+                        vals.push(pop_or_unknown(&mut stack));
+                    }
+                    vals.reverse();
+                    cur_stmts(&mut frames, &mut top).push(Stmt::Return { values: vals });
+                    stack.clear();
+                    continue;
+                }
+                // `br` to a result-block carries values: merge through phi.
+                let phi = frames
+                    .iter()
+                    .rev()
+                    .nth(relative_depth as usize)
+                    .and_then(|f| f.phi);
+                if let Some(p) = phi {
+                    let v = pop_or_unknown(&mut stack);
+                    cur_stmts(&mut frames, &mut top).push(Stmt::Assign {
+                        dst: format!("t{p}"),
+                        expr: v,
+                    });
+                    if let Some(f) = frames.iter_mut().rev().nth(relative_depth as usize) {
+                        f.phi_assigned = true;
+                    }
+                }
                 // Unconditional transfer: fallthrough code up to End is dead.
                 // Reset to the CURRENT frame entry (not the target's): the
                 // target path is gone, and dead fallthrough must not inherit
@@ -528,6 +612,49 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
             Operator::BrIf { relative_depth } => {
                 let c = pop_or_unknown(&mut stack);
                 let (label, is_loop, _entry) = resolve_target(&frames, relative_depth);
+                if label == "func_end" {
+                    // Conditional function exit: `if (c) return vals`.
+                    let mut vals = Vec::new();
+                    for _ in 0..results.len() {
+                        vals.push(pop_or_unknown(&mut stack));
+                    }
+                    vals.reverse();
+                    cur_stmts(&mut frames, &mut top).push(Stmt::If {
+                        cond: c,
+                        then_b: vec![Stmt::Return { values: vals }],
+                        else_b: Vec::new(),
+                    });
+                    // fallthrough keeps stack as-is (minus cond+results)
+                    continue;
+                }
+                let phi = frames
+                    .iter()
+                    .rev()
+                    .nth(relative_depth as usize)
+                    .and_then(|f| f.phi);
+                if let Some(p) = phi {
+                    // Conditional merge: assign phi only on the taken path.
+                    let v = pop_or_unknown(&mut stack);
+                    if let Some(f) = frames.iter_mut().rev().nth(relative_depth as usize) {
+                        f.phi_assigned = true;
+                    }
+                    cur_stmts(&mut frames, &mut top).push(Stmt::If {
+                        cond: c,
+                        then_b: vec![
+                            Stmt::Assign {
+                                dst: format!("t{p}"),
+                                expr: v,
+                            },
+                            Stmt::Br {
+                                depth: relative_depth,
+                                label,
+                                is_loop,
+                            },
+                        ],
+                        else_b: Vec::new(),
+                    });
+                    continue;
+                }
                 // br_if does not unwind on fallthrough; keep stack as-is
                 cur_stmts(&mut frames, &mut top).push(Stmt::BrIf {
                     depth: relative_depth,
@@ -546,6 +673,55 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                 }
                 let def = targets.default();
                 let (dlabel, dis_loop, _) = resolve_target(&frames, def);
+                // Result-carrying br_table: every target with a phi merges
+                // the same carried value. The transfer is unconditional, so
+                // pre-assigning all phis before the switch is sound (exactly
+                // one target is taken; dead fallthrough never reads them).
+                let any_phi = tvec
+                    .iter()
+                    .map(|(d, _, _)| *d)
+                    .chain(std::iter::once(def))
+                    .any(|d| {
+                        frames.iter().rev().nth(d as usize).and_then(|f| f.phi).is_some()
+                    });
+                let any_func_end = tvec.iter().any(|(_, l, _)| l == "func_end") || dlabel == "func_end";
+                if any_phi || (any_func_end && !results.is_empty()) {
+                    let v = pop_or_unknown(&mut stack);
+                    if any_func_end {
+                        cur_stmts(&mut frames, &mut top).push(Stmt::Comment(
+                            "br_table targets function end with values: per-target returns not merged; fallthrough value used"
+                                .into(),
+                        ));
+                    }
+                    // Collect target depths carrying phis first (borrow), then assign.
+                    let mut phi_depths = Vec::new();
+                    for (d, _, _) in &tvec {
+                        if frames.iter().rev().nth(*d as usize).and_then(|f| f.phi).is_some() {
+                            phi_depths.push(*d);
+                        }
+                    }
+                    if frames.iter().rev().nth(def as usize).and_then(|f| f.phi).is_some() {
+                        phi_depths.push(def);
+                    }
+                    for d in phi_depths {
+                        let p = frames.iter().rev().nth(d as usize).and_then(|f| f.phi).unwrap();
+                        cur_stmts(&mut frames, &mut top).push(Stmt::Assign {
+                            dst: format!("t{p}"),
+                            expr: v.clone(),
+                        });
+                        if let Some(f) = frames.iter_mut().rev().nth(d as usize) {
+                            f.phi_assigned = true;
+                        }
+                    }
+                    if !any_phi {
+                        // Values target only func_end (unmergable): keep the
+                        // stack honest by dropping the carried value openly.
+                        cur_stmts(&mut frames, &mut top).push(Stmt::Comment(
+                            "br_table value to function end dropped (unmerged)".into(),
+                        ));
+                    }
+                    let _ = v;
+                }
                 // Same dead-fallthrough rule as Br: reset to current entry.
                 if let Some(f) = frames.last() {
                     let entry = f.entry_depth;
@@ -614,8 +790,10 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     .get(type_index as usize)
                     .cloned()
                     .unwrap_or((Vec::new(), Vec::new()));
-                let args = pop_n_or_unknown(&mut stack, p.len());
+                // Stack order: [args..., index] with index on top —
+                // pop index FIRST, then args (popping args first swaps them).
                 let index = pop_or_unknown(&mut stack);
+                let args = pop_n_or_unknown(&mut stack, p.len());
                 // resolve if const
                 let resolved = index.const_i32().and_then(|v| {
                     if v < 0 {
@@ -707,17 +885,25 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
             Operator::I32Eqz => unop("!", &mut stack),
             Operator::I32Eq => binop("==", &mut stack),
             Operator::I32Ne => binop("!=", &mut stack),
-            Operator::I32LtS | Operator::I32LtU => binop("<", &mut stack),
-            Operator::I32GtS | Operator::I32GtU => binop(">", &mut stack),
-            Operator::I32LeS | Operator::I32LeU => binop("<=", &mut stack),
-            Operator::I32GeS | Operator::I32GeU => binop(">=", &mut stack),
+            Operator::I32LtS => binop("<", &mut stack),
+            Operator::I32LtU => binop("<u32", &mut stack),
+            Operator::I32GtS => binop(">", &mut stack),
+            Operator::I32GtU => binop(">u32", &mut stack),
+            Operator::I32LeS => binop("<=", &mut stack),
+            Operator::I32LeU => binop("<=u32", &mut stack),
+            Operator::I32GeS => binop(">=", &mut stack),
+            Operator::I32GeU => binop(">=u32", &mut stack),
             Operator::I64Eqz => unop("!", &mut stack),
             Operator::I64Eq => binop("==", &mut stack),
             Operator::I64Ne => binop("!=", &mut stack),
-            Operator::I64LtS | Operator::I64LtU => binop("<", &mut stack),
-            Operator::I64GtS | Operator::I64GtU => binop(">", &mut stack),
-            Operator::I64LeS | Operator::I64LeU => binop("<=", &mut stack),
-            Operator::I64GeS | Operator::I64GeU => binop(">=", &mut stack),
+            Operator::I64LtS => binop("<", &mut stack),
+            Operator::I64LtU => binop("<u64", &mut stack),
+            Operator::I64GtS => binop(">", &mut stack),
+            Operator::I64GtU => binop(">u64", &mut stack),
+            Operator::I64LeS => binop("<=", &mut stack),
+            Operator::I64LeU => binop("<=u64", &mut stack),
+            Operator::I64GeS => binop(">=", &mut stack),
+            Operator::I64GeU => binop(">=u64", &mut stack),
             Operator::F32Eq => binop("==", &mut stack),
             Operator::F32Ne => binop("!=", &mut stack),
             Operator::F32Lt => binop("<", &mut stack),
@@ -756,13 +942,16 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
             }
             Operator::I32Sub => binop("-", &mut stack),
             Operator::I32Mul => binop("*", &mut stack),
-            Operator::I32DivS | Operator::I32DivU => binop("/", &mut stack),
-            Operator::I32RemS | Operator::I32RemU => binop("%", &mut stack),
+            Operator::I32DivS => binop("/", &mut stack),
+            Operator::I32DivU => binop("/u32", &mut stack),
+            Operator::I32RemS => binop("%", &mut stack),
+            Operator::I32RemU => binop("%u32", &mut stack),
             Operator::I32And => binop("&", &mut stack),
             Operator::I32Or => binop("|", &mut stack),
             Operator::I32Xor => binop("^", &mut stack),
             Operator::I32Shl => binop("<<", &mut stack),
-            Operator::I32ShrS | Operator::I32ShrU => binop(">>", &mut stack),
+            Operator::I32ShrS => binop(">>", &mut stack),
+            Operator::I32ShrU => binop(">>u32", &mut stack),
             Operator::I32Rotl | Operator::I32Rotr => {
                 let b = pop_or_unknown(&mut stack);
                 let a = pop_or_unknown(&mut stack);
@@ -775,13 +964,16 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
             Operator::I64Add => binop("+", &mut stack),
             Operator::I64Sub => binop("-", &mut stack),
             Operator::I64Mul => binop("*", &mut stack),
-            Operator::I64DivS | Operator::I64DivU => binop("/", &mut stack),
-            Operator::I64RemS | Operator::I64RemU => binop("%", &mut stack),
+            Operator::I64DivS => binop("/", &mut stack),
+            Operator::I64DivU => binop("/u64", &mut stack),
+            Operator::I64RemS => binop("%", &mut stack),
+            Operator::I64RemU => binop("%u64", &mut stack),
             Operator::I64And => binop("&", &mut stack),
             Operator::I64Or => binop("|", &mut stack),
             Operator::I64Xor => binop("^", &mut stack),
             Operator::I64Shl => binop("<<", &mut stack),
-            Operator::I64ShrS | Operator::I64ShrU => binop(">>", &mut stack),
+            Operator::I64ShrS => binop(">>", &mut stack),
+            Operator::I64ShrU => binop(">>u64", &mut stack),
             Operator::I64Rotl | Operator::I64Rotr => {
                 let b = pop_or_unknown(&mut stack);
                 let a = pop_or_unknown(&mut stack);
@@ -797,48 +989,193 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
             Operator::F32Div | Operator::F64Div => binop("/", &mut stack),
             Operator::F32Min | Operator::F64Min => binop("min", &mut stack),
             Operator::F32Max | Operator::F64Max => binop("max", &mut stack),
-            Operator::I32WrapI64 => unop("(i32)", &mut stack),
-            Operator::I64ExtendI32S | Operator::I64ExtendI32U => unop("(i64)", &mut stack),
-            // loads
-            Operator::I32Load { memarg }
-            | Operator::I32Load8S { memarg }
-            | Operator::I32Load8U { memarg }
-            | Operator::I32Load16S { memarg }
-            | Operator::I32Load16U { memarg } => {
+            Operator::I32WrapI64 => unop("(int32_t)", &mut stack),
+            Operator::I64ExtendI32S => {
+                unop("(int32_t)", &mut stack);
+                unop("(int64_t)", &mut stack);
+            }
+            Operator::I64ExtendI32U => {
+                unop("(uint32_t)", &mut stack);
+                unop("(int64_t)", &mut stack);
+            }
+            // loads (signedness preserved: S vs U matters for <8/4-byte
+            // loads — zero- vs sign-extension changes the value)
+            Operator::I32Load { memarg } => {
                 let base = pop_or_unknown(&mut stack);
-                let w = load_width(&op);
-                let ty = format!("i32/w{w}");
                 accesses.push(MemAccess {
                     base_desc: base_desc(&base),
                     offset: memarg.offset,
-                    width: w,
+                    width: 4,
                     is_write: false,
                     dom_ty: "i32".into(),
                 });
                 stack.push(Expr::Load {
-                    ty,
+                    ty: "i32".into(),
                     base: Box::new(base),
                     offset: memarg.offset,
                 });
             }
-            Operator::I64Load { memarg }
-            | Operator::I64Load8S { memarg }
-            | Operator::I64Load8U { memarg }
-            | Operator::I64Load16S { memarg }
-            | Operator::I64Load16U { memarg }
-            | Operator::I64Load32S { memarg }
-            | Operator::I64Load32U { memarg } => {
+            Operator::I32Load8S { memarg } => {
                 let base = pop_or_unknown(&mut stack);
-                let w = load_width(&op);
                 accesses.push(MemAccess {
                     base_desc: base_desc(&base),
                     offset: memarg.offset,
-                    width: w,
+                    width: 1,
+                    is_write: false,
+                    dom_ty: "i32.s8".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i32/s1".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I32Load8U { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 1,
+                    is_write: false,
+                    dom_ty: "i32.u8".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i32/u1".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I32Load16S { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 2,
+                    is_write: false,
+                    dom_ty: "i32.s16".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i32/s2".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I32Load16U { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 2,
+                    is_write: false,
+                    dom_ty: "i32.u16".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i32/u2".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I64Load { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 8,
                     is_write: false,
                     dom_ty: "i64".into(),
                 });
                 stack.push(Expr::Load {
-                    ty: format!("i64/w{w}"),
+                    ty: "i64".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I64Load8S { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 1,
+                    is_write: false,
+                    dom_ty: "i64.s8".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i64/s1".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I64Load8U { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 1,
+                    is_write: false,
+                    dom_ty: "i64.u8".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i64/u1".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I64Load16S { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 2,
+                    is_write: false,
+                    dom_ty: "i64.s16".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i64/s2".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I64Load16U { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 2,
+                    is_write: false,
+                    dom_ty: "i64.u16".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i64/u2".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I64Load32S { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 4,
+                    is_write: false,
+                    dom_ty: "i64.s32".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i64/s4".into(),
+                    base: Box::new(base),
+                    offset: memarg.offset,
+                });
+            }
+            Operator::I64Load32U { memarg } => {
+                let base = pop_or_unknown(&mut stack);
+                accesses.push(MemAccess {
+                    base_desc: base_desc(&base),
+                    offset: memarg.offset,
+                    width: 4,
+                    is_write: false,
+                    dom_ty: "i64.u32".into(),
+                });
+                stack.push(Expr::Load {
+                    ty: "i64/u4".into(),
                     base: Box::new(base),
                     offset: memarg.offset,
                 });
@@ -957,42 +1294,98 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     v: Box::new(d),
                 });
             }
-            // generic numeric conversions: model as unop to keep stack balanced
-            Operator::I32TruncF32S
-            | Operator::I32TruncF32U
-            | Operator::I32TruncF64S
-            | Operator::I32TruncF64U
-            | Operator::I32ReinterpretF32
-            | Operator::I32Extend8S
-            | Operator::I32Extend16S
-            | Operator::I32TruncSatF32S
-            | Operator::I32TruncSatF32U
-            | Operator::I32TruncSatF64S
-            | Operator::I32TruncSatF64U => unop("(i32)", &mut stack),
-            Operator::I64TruncF32S
-            | Operator::I64TruncF32U
-            | Operator::I64TruncF64S
-            | Operator::I64TruncF64U
-            | Operator::I64ReinterpretF64
-            | Operator::I64Extend8S
-            | Operator::I64Extend16S
-            | Operator::I64Extend32S
-            | Operator::I64TruncSatF32S
-            | Operator::I64TruncSatF32U
-            | Operator::I64TruncSatF64S
-            | Operator::I64TruncSatF64U => unop("(i64)", &mut stack),
-            Operator::F32ConvertI32S
-            | Operator::F32ConvertI32U
-            | Operator::F32ConvertI64S
-            | Operator::F32ConvertI64U
-            | Operator::F32DemoteF64
-            | Operator::F32ReinterpretI32 => unop("(f32)", &mut stack),
-            Operator::F64ConvertI32S
-            | Operator::F64ConvertI32U
-            | Operator::F64ConvertI64S
-            | Operator::F64ConvertI64U
-            | Operator::F64PromoteF32
-            | Operator::F64ReinterpretI64 => unop("(f64)", &mut stack),
+            // numeric conversions with signedness preserved (trunc/convert
+            // S vs U differ on large values; reinterpret is bitwise, not numeric)
+            Operator::I32TruncF32S | Operator::I32TruncF64S => unop("(int32_t)", &mut stack),
+            Operator::I32TruncF32U | Operator::I32TruncF64U => unop("(uint32_t)", &mut stack),
+            Operator::I32ReinterpretF32 => {
+                let v = pop_or_unknown(&mut stack);
+                stack.push(Expr::Simd { op: "f32_to_u32".into(), args: vec![v] });
+            }
+            Operator::I32Extend8S => {
+                unop("(int8_t)", &mut stack);
+                unop("(int32_t)", &mut stack);
+            }
+            Operator::I32Extend16S => {
+                unop("(int16_t)", &mut stack);
+                unop("(int32_t)", &mut stack);
+            }
+            Operator::I32TruncSatF32S | Operator::I32TruncSatF64S => {
+                let v = pop_or_unknown(&mut stack);
+                let name = op_mnemonic(&op);
+                stack.push(Expr::Simd { op: name, args: vec![v] });
+            }
+            Operator::I32TruncSatF32U | Operator::I32TruncSatF64U => {
+                let v = pop_or_unknown(&mut stack);
+                let name = op_mnemonic(&op);
+                stack.push(Expr::Simd { op: name, args: vec![v] });
+            }
+            Operator::I64TruncF32S | Operator::I64TruncF64S => unop("(int64_t)", &mut stack),
+            Operator::I64TruncF32U | Operator::I64TruncF64U => unop("(uint64_t)", &mut stack),
+            Operator::I64ReinterpretF64 => {
+                let v = pop_or_unknown(&mut stack);
+                stack.push(Expr::Simd { op: "f64_to_u64".into(), args: vec![v] });
+            }
+            Operator::I64Extend8S => {
+                unop("(int8_t)", &mut stack);
+                unop("(int64_t)", &mut stack);
+            }
+            Operator::I64Extend16S => {
+                unop("(int16_t)", &mut stack);
+                unop("(int64_t)", &mut stack);
+            }
+            Operator::I64Extend32S => {
+                unop("(int32_t)", &mut stack);
+                unop("(int64_t)", &mut stack);
+            }
+            Operator::I64TruncSatF32S | Operator::I64TruncSatF64S
+            | Operator::I64TruncSatF32U | Operator::I64TruncSatF64U => {
+                let v = pop_or_unknown(&mut stack);
+                let name = op_mnemonic(&op);
+                stack.push(Expr::Simd { op: name, args: vec![v] });
+            }
+            Operator::F32ConvertI32S => {
+                unop("(int32_t)", &mut stack);
+                unop("(float)", &mut stack);
+            }
+            Operator::F32ConvertI32U => {
+                unop("(uint32_t)", &mut stack);
+                unop("(float)", &mut stack);
+            }
+            Operator::F32ConvertI64S => {
+                unop("(int64_t)", &mut stack);
+                unop("(float)", &mut stack);
+            }
+            Operator::F32ConvertI64U => {
+                unop("(uint64_t)", &mut stack);
+                unop("(float)", &mut stack);
+            }
+            Operator::F32DemoteF64 => unop("(float)", &mut stack),
+            Operator::F32ReinterpretI32 => {
+                let v = pop_or_unknown(&mut stack);
+                stack.push(Expr::Simd { op: "u32_to_float".into(), args: vec![v] });
+            }
+            Operator::F64ConvertI32S => {
+                unop("(int32_t)", &mut stack);
+                unop("(double)", &mut stack);
+            }
+            Operator::F64ConvertI32U => {
+                unop("(uint32_t)", &mut stack);
+                unop("(double)", &mut stack);
+            }
+            Operator::F64ConvertI64S => {
+                unop("(int64_t)", &mut stack);
+                unop("(double)", &mut stack);
+            }
+            Operator::F64ConvertI64U => {
+                unop("(uint64_t)", &mut stack);
+                unop("(double)", &mut stack);
+            }
+            Operator::F64PromoteF32 => unop("(double)", &mut stack),
+            Operator::F64ReinterpretI64 => {
+                let v = pop_or_unknown(&mut stack);
+                stack.push(Expr::Simd { op: "u64_to_double".into(), args: vec![v] });
+            }
             Operator::F32Neg
             | Operator::F32Abs
             | Operator::F32Ceil
@@ -1178,8 +1571,9 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     .get(type_index as usize)
                     .cloned()
                     .unwrap_or((Vec::new(), Vec::new()));
-                let args = pop_n_or_unknown(&mut stack, p.len());
+                // Same stack order as call_indirect: index on top.
                 let index = pop_or_unknown(&mut stack);
+                let args = pop_n_or_unknown(&mut stack, p.len());
                 indirects.push(index.const_i32().and_then(|v| {
                     (v >= 0).then(|| {
                         meta.tables
@@ -1217,8 +1611,9 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     .get(type_index as usize)
                     .cloned()
                     .unwrap_or((Vec::new(), Vec::new()));
-                let args = pop_n_or_unknown(&mut stack, p.len());
+                // Stack order: [args..., funcref] with ref on top.
                 let fref = pop_or_unknown(&mut stack);
+                let args = pop_n_or_unknown(&mut stack, p.len());
                 let mut all = vec![fref];
                 all.extend(args);
                 if r.is_empty() {
@@ -1245,8 +1640,9 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     .get(type_index as usize)
                     .cloned()
                     .unwrap_or((Vec::new(), Vec::new()));
-                let args = pop_n_or_unknown(&mut stack, p.len());
+                // Same stack order as call_ref: ref on top.
                 let fref = pop_or_unknown(&mut stack);
+                let args = pop_n_or_unknown(&mut stack, p.len());
                 let mut all = vec![fref];
                 all.extend(args);
                 if r.is_empty() {
@@ -1329,10 +1725,19 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                 op: "struct.new_default".into(),
                 args: vec![Expr::ConstI32(struct_type_index as i32)],
             }),
-            op @ (Operator::StructGet { .. }
-            | Operator::StructGetS { .. }
-            | Operator::StructGetU { .. }) => {
-                simd_pop_push(&op, &mut stack, 1, 1);
+            Operator::StructGet { struct_type_index, field_index }
+            | Operator::StructGetS { struct_type_index, field_index }
+            | Operator::StructGetU { struct_type_index, field_index } => {
+                let sref = pop_or_unknown(&mut stack);
+                let name = op_mnemonic(&op);
+                stack.push(Expr::Simd {
+                    op: name,
+                    args: vec![
+                        sref,
+                        Expr::ConstI32(struct_type_index as i32),
+                        Expr::ConstI32(field_index as i32),
+                    ],
+                });
             }
             Operator::StructSet { struct_type_index, field_index } => {
                 let v = pop_or_unknown(&mut stack);
@@ -1348,8 +1753,10 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                 }));
             }
             Operator::ArrayNew { array_type_index } => {
-                let init = pop_or_unknown(&mut stack);
+                // Stack order: [init, len] with len on top (wasmtime-verified:
+                // `(array.new $a (3)(99))` yields len 99 of init 3).
                 let len = pop_or_unknown(&mut stack);
+                let init = pop_or_unknown(&mut stack);
                 stack.push(Expr::Simd {
                     op: "array.new".into(),
                     args: vec![len, init, Expr::ConstI32(array_type_index as i32)],
@@ -1397,16 +1804,34 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     ],
                 });
             }
-            op @ (Operator::ArrayGet { .. }
-            | Operator::ArrayGetS { .. }
-            | Operator::ArrayGetU { .. }) => {
-                simd_pop_push(&op, &mut stack, 2, 1);
+            Operator::ArrayGet { array_type_index }
+            | Operator::ArrayGetS { array_type_index }
+            | Operator::ArrayGetU { array_type_index } => {
+                let i = pop_or_unknown(&mut stack);
+                let a = pop_or_unknown(&mut stack);
+                let name = op_mnemonic(&op);
+                stack.push(Expr::Simd {
+                    op: name,
+                    args: vec![a, i, Expr::ConstI32(array_type_index as i32)],
+                });
+            }
+            Operator::RefTestNonNull { hty } | Operator::RefTestNullable { hty } => {
+                let r = pop_or_unknown(&mut stack);
+                let name = op_mnemonic(&op);
+                stack.push(Expr::Simd {
+                    op: name,
+                    args: vec![r, Expr::Raw(format!("{hty:?}"))],
+                });
+            }
+            Operator::RefCastNonNull { hty } | Operator::RefCastNullable { hty } => {
+                let r = pop_or_unknown(&mut stack);
+                let name = op_mnemonic(&op);
+                stack.push(Expr::Simd {
+                    op: name,
+                    args: vec![r, Expr::Raw(format!("{hty:?}"))],
+                });
             }
             op @ (Operator::ArrayLen
-            | Operator::RefTestNonNull { .. }
-            | Operator::RefTestNullable { .. }
-            | Operator::RefCastNonNull { .. }
-            | Operator::RefCastNullable { .. }
             | Operator::AnyConvertExtern
             | Operator::ExternConvertAny
             | Operator::RefI31
@@ -1523,6 +1948,8 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     in_else: false,
                     entry_depth: stack.len(),
                     results: r.min(1),
+                    phi: None,
+                    phi_assigned: false,
                 });
                 cur_stmts(&mut frames, &mut top)
                     .push(Stmt::Comment(format!("try_table [{catches}]")));
@@ -1555,6 +1982,8 @@ fn lift_function(idx: u32, body: &FunctionBody, meta: &ModuleMeta) -> Result<Fun
                     in_else: false,
                     entry_depth: stack.len(),
                     results: r,
+                    phi: None,
+                    phi_assigned: false,
                 });
                 cur_stmts(&mut frames, &mut top).push(Stmt::Comment("try {".into()));
             }
@@ -2280,15 +2709,6 @@ fn resolve_target(frames: &[Frame], depth: u32) -> (String, bool, usize) {
     } else {
         ("func_end".to_string(), false, 0)
     }
-}
-
-fn target_entry(frames: &[Frame], depth: u32) -> usize {
-    frames
-        .iter()
-        .rev()
-        .nth(depth as usize)
-        .map(|f| f.entry_depth)
-        .unwrap_or(0)
 }
 
 fn atomic_mem(op: &Operator) -> (u64, u8) {

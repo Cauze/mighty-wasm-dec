@@ -2,7 +2,7 @@
 
 Every opcode group has an explicit lifting arm except stack-switching
 (no text toolchain to produce it; honest fallback with exact... nearest
-fallback). Verified 2026-09-28: all 15 C-corpus + 7 wat-corpus files
+fallback). Verified 2026-09-28: all 15 C-corpus + 15 wat-corpus files
 decompile with zero `unhandled` / `stack-underflow` / `br_depth` markers.
 
 ## By proposal group
@@ -11,7 +11,7 @@ decompile with zero `unhandled` / `stack-underflow` / `br_depth` markers.
 |---|---|---|---|
 | mvp control/vars/memory/numeric | ~200 | explicit | all C files |
 | sign_extension (5) | 5 | explicit | `intops` |
-| saturating float→int (8) | 8 | explicit (casts) | `conv` |
+| saturating float→int (8) | 8 | explicit (named pseudo-calls; plain casts would be UB) | `conv` |
 | bulk_memory (7) | 7 | explicit pseudo-calls | `bulk.wat`; `memory` (lowered inline by LLVM) |
 | reference_types (11) | 11 | explicit pseudo-calls | `refs.wat` |
 | tail_call (2) | 2 | explicit (call + return) | `tail.wat` |

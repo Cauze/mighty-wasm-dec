@@ -77,14 +77,51 @@ pub fn collect_strings(data: &[DataSeg]) -> Vec<StrEntry> {
     out
 }
 
+/// Binary-search string lookup (perf R3): `strings` is sorted by addr
+/// (see `collect_strings`), so this replaces the old linear `iter().find`
+/// per access — identical result on non-overlapping entries, O(log S).
+fn str_lookup(strings: &[StrEntry], addr: u64) -> Option<&StrEntry> {
+    let i = strings.partition_point(|e| e.addr <= addr);
+    if i == 0 {
+        return None;
+    }
+    let e = &strings[i - 1];
+    if addr < e.addr + e.len as u64 {
+        Some(e)
+    } else {
+        None
+    }
+}
+
+fn str_by_addr(strings: &[StrEntry], addr: u64) -> Option<&StrEntry> {
+    strings
+        .binary_search_by_key(&addr, |e| e.addr)
+        .ok()
+        .map(|i| &strings[i])
+}
+
 struct EmitCtx<'a> {
-    layouts: &'a HashMap<String, (String, u64)>,
+    layouts: &'a HashMap<String, (String, u64, u8)>,
     data: &'a [DataSeg],
+    /// (start, end, seg idx) sorted by start, built once (perf R3).
+    data_bounds: &'a [(u64, u64, u32)],
     strings: &'a [StrEntry],
     mode: StringsMode,
     struct_on: bool,
     /// labels targeted by goto (for collapsing unreferenced blocks)
     ref_labels: &'a HashSet<String>,
+}
+
+/// Binary-search data-segment lookup (perf R3): replaces the old linear
+/// scan over all segments per constant-address access. Returns seg idx +
+/// segment start for the `dataN+off` note.
+fn data_seg_lookup(bounds: &[(u64, u64, u32)], addr: u64) -> Option<(u32, u64)> {
+    let i = bounds.partition_point(|(s, _, _)| *s <= addr);
+    if i == 0 {
+        return None;
+    }
+    let (s, e, idx) = bounds[i - 1];
+    (addr < e).then_some((idx, s))
 }
 
 fn indent(n: usize) -> String {
@@ -94,19 +131,56 @@ fn indent(n: usize) -> String {
     "  ".repeat(n.min(32))
 }
 
+fn load_byte_width(ty: &str) -> u8 {
+    if ty == "v128" {
+        16
+    } else if ty.contains("f64") || ty.contains("w8") {
+        8
+    } else if ty.contains("f32") {
+        4
+    } else if ty.contains("s1") || ty.contains("u1") || ty.contains("w1") {
+        1
+    } else if ty.contains("s2") || ty.contains("u2") || ty.contains("w2") {
+        2
+    } else if ty.contains("s4") || ty.contains("u4") || ty.contains("w4") {
+        4
+    } else if ty.contains("i64") {
+        8
+    } else {
+        4
+    }
+}
+
+fn is_byte_ty(ty: &str) -> bool {
+    load_byte_width(ty) == 1
+}
+
 fn c_ty_of_load(ty: &str) -> &'static str {
     if ty == "v128" {
         "__v128"
+    } else if ty.contains("s1") {
+        "int8_t"
+    } else if ty.contains("u1") {
+        "uint8_t"
     } else if ty.contains("w1") {
         "int8_t"
+    } else if ty.contains("s2") {
+        "int16_t"
+    } else if ty.contains("u2") {
+        "uint16_t"
     } else if ty.contains("w2") {
         "int16_t"
     } else if ty.contains("f32") {
         "float"
     } else if ty.contains("f64") {
         "double"
-    } else if ty.contains("i64") && !ty.contains("w4") {
-        // i64/w8 loads; i64/w4 is a 4-byte zero-extended load -> int32_t
+    } else if ty == "i64/s4" || ty.contains("i64/w4") {
+        // 4-byte sign-extended load -> int32_t
+        "int32_t"
+    } else if ty.contains("i64/u4") {
+        "uint32_t"
+    } else if ty.contains("i64") && !ty.contains("s4") && !ty.contains("u4") && !ty.contains("w4") {
+        // i64/w8 loads
         "int64_t"
     } else if ty == "atomic/w8" {
         "int64_t"
@@ -116,107 +190,298 @@ fn c_ty_of_load(ty: &str) -> &'static str {
 }
 
 fn emit_expr(e: &Expr, ctx: &EmitCtx) -> String {
+    let mut s = String::new();
+    emit_expr_into(e, ctx, &mut s);
+    s
+}
+
+/// Linear-time expression renderer (perf): writes directly into `out`
+/// instead of building owned `String`s bottom-up (the old `format!` per
+/// node was O(depth²) on deep chains: 200 funcs × 300-deep adds spent
+/// 118ms in emit). Byte-identical output to the old renderer.
+fn emit_expr_into(e: &Expr, ctx: &EmitCtx, out: &mut String) {
+    use std::fmt::Write as _;
     match e {
-        Expr::ConstI32(v) => format!("{v}"),
-        Expr::ConstI64(v) => format!("{v}ll"),
+        Expr::ConstI32(v) => {
+            let _ = write!(out, "{v}");
+        }
+        Expr::ConstI64(v) => {
+            let _ = write!(out, "{v}ll");
+        }
         Expr::ConstF32(b) => {
             let f = f32::from_bits(*b);
             if f.is_finite() {
-                format!("{f:?}")
+                let _ = write!(out, "{f:?}");
+            } else if f.is_infinite() {
+                out.push_str(if f.is_sign_negative() { "(-INFINITY)" } else { "INFINITY" });
             } else {
-                format!("((float)(0x{b:08x}))")
+                let _ = write!(out, "u32_to_float(0x{b:08x})");
             }
         }
         Expr::ConstF64(b) => {
             let f = f64::from_bits(*b);
             if f.is_finite() {
-                format!("{f:?}")
+                let _ = write!(out, "{f:?}");
+            } else if f.is_infinite() {
+                out.push_str(if f.is_sign_negative() { "(-INFINITY)" } else { "INFINITY" });
             } else {
-                format!("((double)(0x{b:016x}))")
+                let _ = write!(out, "u64_to_double(0x{b:016x})");
             }
         }
-        Expr::Local(i) => format!("l{i}"),
-        Expr::Tmp(i) => format!("t{i}"),
-        Expr::Global(i) => format!("g{i}"),
-        Expr::MemorySize(m) => format!("memory_size({m})"),
+        Expr::Local(i) => {
+            let _ = write!(out, "l{i}");
+        }
+        Expr::Tmp(i) => {
+            let _ = write!(out, "t{i}");
+        }
+        Expr::Global(i) => {
+            let _ = write!(out, "g{i}");
+        }
+        Expr::MemorySize(m) => {
+            let _ = write!(out, "memory_size({m})");
+        }
         Expr::Binop { op, lhs, rhs } => {
-            format!("({} {} {})", emit_expr(lhs, ctx), op, emit_expr(rhs, ctx))
+            // Unsigned wasm ops need unsigned C semantics: plain `>`, `>>`,
+            // `/`, `%` on int32_t/int64_t are signed in C (wrong for *_u).
+            match op.as_str() {
+                "<u32" => {
+                    out.push_str("((uint32_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") < (uint32_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str("))");
+                }
+                ">u32" => {
+                    out.push_str("((uint32_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") > (uint32_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str("))");
+                }
+                "<=u32" => {
+                    out.push_str("((uint32_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") <= (uint32_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str("))");
+                }
+                ">=u32" => {
+                    out.push_str("((uint32_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") >= (uint32_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str("))");
+                }
+                "<u64" => {
+                    out.push_str("((uint64_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") < (uint64_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str("))");
+                }
+                ">u64" => {
+                    out.push_str("((uint64_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") > (uint64_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str("))");
+                }
+                "<=u64" => {
+                    out.push_str("((uint64_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") <= (uint64_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str("))");
+                }
+                ">=u64" => {
+                    out.push_str("((uint64_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") >= (uint64_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str("))");
+                }
+                ">>u32" => {
+                    out.push_str("((int32_t)((uint32_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") >> (");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str(")))");
+                }
+                ">>u64" => {
+                    out.push_str("((int64_t)((uint64_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") >> (");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str(")))");
+                }
+                "/u32" => {
+                    out.push_str("((int32_t)((uint32_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") / (uint32_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str(")))");
+                }
+                "%u32" => {
+                    out.push_str("((int32_t)((uint32_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") % (uint32_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str(")))");
+                }
+                "/u64" => {
+                    out.push_str("((int64_t)((uint64_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") / (uint64_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str(")))");
+                }
+                "%u64" => {
+                    out.push_str("((int64_t)((uint64_t)(");
+                    emit_expr_into(lhs, ctx, out);
+                    out.push_str(") % (uint64_t)(");
+                    emit_expr_into(rhs, ctx, out);
+                    out.push_str(")))");
+                }
+                _ => {
+                    out.push('(');
+                    emit_expr_into(lhs, ctx, out);
+                    out.push(' ');
+                    out.push_str(op);
+                    out.push(' ');
+                    emit_expr_into(rhs, ctx, out);
+                    out.push(')');
+                }
+            }
         }
         Expr::Unop { op, v } => {
             if op == "memgrow(" {
-                format!("memgrow({}))", emit_expr(v, ctx))
+                out.push_str("memgrow(");
+                emit_expr_into(v, ctx, out);
+                out.push_str("))");
             } else {
-                format!("({}{})", op, emit_expr(v, ctx))
+                out.push('(');
+                out.push_str(op);
+                emit_expr_into(v, ctx, out);
+                out.push(')');
             }
         }
         Expr::Load { ty, base, offset } => {
-            // defs-mode byte reads from known strings render as s_<addr>[i]
-            if ctx.mode == StringsMode::Defs {
-                if let Some((sym, idx)) = string_index(base, *offset, ty, ctx) {
-                    return format!("{sym}[{idx}]");
-                }
-            }
-            // constant base folds into a single absolute address
-            if let Expr::ConstI32(a) = **base {
-                let total = (a as i64 as u64).wrapping_add(*offset);
-                if ty.starts_with("atomic") {
-                    return format!("atomic.load(mem + {total})");
-                }
-                let ct = c_ty_of_load(ty);
-                return format!("*({ct}*)(mem + {total})");
-            }
-            if let Expr::ConstI64(a) = **base {
-                let total = (a as u64).wrapping_add(*offset);
-                if ty.starts_with("atomic") {
-                    return format!("atomic.load(mem + {total})");
-                }
-                let ct = c_ty_of_load(ty);
-                return format!("*({ct}*)(mem + {total})");
-            }
-            if ty.starts_with("atomic") {
-                let b = emit_expr(base, ctx);
-                if *offset == 0 {
-                    return format!("atomic.load(mem + ({b}))");
-                } else {
-                    return format!("atomic.load(mem + ({b}) + {offset})");
-                }
-            }
-            let ct = c_ty_of_load(ty);
-            let b = emit_expr(base, ctx);
-            if *offset == 0 {
-                format!("*({ct}*)(mem + ({b}))")
-            } else {
-                format!("*({ct}*)(mem + ({b}) + {offset})")
-            }
+            emit_load_into(ty, base, *offset, ctx, out);
         }
-        Expr::Call { func: _, name, args } => {
-            let a: Vec<String> = args.iter().map(|x| emit_expr(x, ctx)).collect();
-            format!("{name}({})", a.join(", "))
+        Expr::Call { name, args, .. } => {
+            out.push_str(name);
+            out.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                emit_expr_into(a, ctx, out);
+            }
+            out.push(')');
         }
         Expr::CallIndirect { index, args, .. } => {
-            let a: Vec<String> = args.iter().map(|x| emit_expr(x, ctx)).collect();
-            format!("table_call({})({})", emit_expr(index, ctx), a.join(", "))
+            out.push_str("table_call(");
+            emit_expr_into(index, ctx, out);
+            out.push_str(")(");
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                emit_expr_into(a, ctx, out);
+            }
+            out.push(')');
         }
         Expr::Select { c, a, b } => {
-            format!(
-                "({} ? {} : {})",
-                emit_expr(c, ctx),
-                emit_expr(a, ctx),
-                emit_expr(b, ctx)
-            )
+            out.push('(');
+            emit_expr_into(c, ctx, out);
+            out.push_str(" ? ");
+            emit_expr_into(a, ctx, out);
+            out.push_str(" : ");
+            emit_expr_into(b, ctx, out);
+            out.push(')');
         }
         Expr::Simd { op, args } => {
-            let a: Vec<String> = args.iter().map(|x| emit_expr(x, ctx)).collect();
-            format!("{op}({})", a.join(", "))
+            out.push_str(op);
+            out.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                emit_expr_into(a, ctx, out);
+            }
+            out.push(')');
         }
-        Expr::Raw(s) => s.clone(),
-        Expr::Unknown(s) => format!("/*{s}*/0"),
+        Expr::Raw(s) => out.push_str(s),
+        Expr::Unknown(s) => {
+            out.push_str("/*");
+            out.push_str(s);
+            out.push_str("*/0");
+        }
     }
 }
 
-/// If base+offset matches a recovered struct field, render as struct access.
-/// The layouts map is pre-expanded through copyprop aliases by the caller.
-fn struct_access(base: &Expr, offset: u64, ctx: &EmitCtx) -> Option<String> {
+/// Load rendering shared by `emit_expr_into` (single owner after R2).
+fn emit_load_into(ty: &str, base: &Expr, offset: u64, ctx: &EmitCtx, out: &mut String) {
+    use std::fmt::Write as _;
+    // defs-mode byte reads from known strings render as s_<addr>[i]
+    if ctx.mode == StringsMode::Defs {
+        if let Some((sym, idx)) = string_index(base, offset, ty, ctx) {
+            out.push_str(&sym);
+            out.push('[');
+            out.push_str(&idx);
+            out.push(']');
+            return;
+        }
+    }
+    // constant base folds into a single absolute address
+    if let Expr::ConstI32(a) = *base {
+        let total = (a as i64 as u64).wrapping_add(offset);
+        if ty.starts_with("atomic") {
+            let _ = write!(out, "atomic.load(mem + {total})");
+            return;
+        }
+        let ct = c_ty_of_load(ty);
+        let _ = write!(out, "*({ct}*)(mem + {total})");
+        return;
+    }
+    if let Expr::ConstI64(a) = *base {
+        let total = (a as u64).wrapping_add(offset);
+        if ty.starts_with("atomic") {
+            let _ = write!(out, "atomic.load(mem + {total})");
+            return;
+        }
+        let ct = c_ty_of_load(ty);
+        let _ = write!(out, "*({ct}*)(mem + {total})");
+        return;
+    }
+    if ty.starts_with("atomic") {
+        out.push_str("atomic.load(mem + (");
+        emit_expr_into(base, ctx, out);
+        out.push(')');
+        if offset == 0 {
+            out.push(')');
+        } else {
+            let _ = write!(out, " + {offset})");
+        }
+        return;
+    }
+    let ct = c_ty_of_load(ty);
+    out.push_str("*(");
+    out.push_str(ct);
+    out.push_str("*)(mem + (");
+    emit_expr_into(base, ctx, out);
+    out.push(')');
+    if offset == 0 {
+        out.push(')');
+    } else {
+        let _ = write!(out, " + {offset})");
+    }
+}
+
+/// If base+offset matches a recovered struct field of the SAME width,
+/// render as struct access. Width mismatches stay raw: a narrow access
+/// through a wide field (or vice versa) would miscompile the byte count.
+fn struct_access(base: &Expr, offset: u64, width: u8, ctx: &EmitCtx) -> Option<String> {
     if !ctx.struct_on {
         return None;
     }
@@ -228,8 +493,9 @@ fn struct_access(base: &Expr, offset: u64, ctx: &EmitCtx) -> Option<String> {
     };
     ctx.layouts
         .get(&format!("{key}+{offset}"))
+        .filter(|(_, _, w)| *w == width)
         .cloned()
-        .map(|(s, _)| s)
+        .map(|(s, _, _)| s)
 }
 
 /// Byte read from a known string in defs mode: `s_<addr>[i]`.
@@ -239,7 +505,7 @@ fn string_index(base: &Expr, mem_offset: u64, ty: &str, ctx: &EmitCtx) -> Option
         return None;
     }
     // Only byte loads read characters; wider loads stay numeric.
-    if !ty.contains("w1") {
+    if !is_byte_ty(ty) {
         return None;
     }
     // split base into (dynamic, const) parts
@@ -254,10 +520,7 @@ fn string_index(base: &Expr, mem_offset: u64, ty: &str, ctx: &EmitCtx) -> Option
         _ => return None,
     };
     let total = c.wrapping_add(mem_offset);
-    let s = ctx
-        .strings
-        .iter()
-        .find(|e| total >= e.addr && total < e.addr + e.len as u64)?;
+    let s = str_lookup(ctx.strings, total)?;
     let k = total - s.addr;
     let sym = format!("s_{}", s.addr);
     let idx = match dyn_part {
@@ -288,11 +551,7 @@ fn data_note(base: &Expr, mem_offset: u64, is_byte: bool, ctx: &EmitCtx) -> Opti
         _ => None,
     };
     if let Some(a) = a {
-        if let Some(s) = ctx
-            .strings
-            .iter()
-            .find(|e| a >= e.addr && a < e.addr + e.len as u64)
-        {
+        if let Some(s) = str_lookup(ctx.strings, a) {
             let shown: String = s.text.chars().take(32).collect();
             let more = if s.text.chars().count() > 32 {
                 format!("…+{}b", s.len)
@@ -301,14 +560,8 @@ fn data_note(base: &Expr, mem_offset: u64, is_byte: bool, ctx: &EmitCtx) -> Opti
             };
             return Some(format!("\"{shown}\"{more}"));
         }
-        for d in ctx.data {
-            if let Some(off) = d.offset {
-                let start = off as i64 as u64;
-                let end = start.wrapping_add(d.bytes.len() as u64);
-                if a >= start && a < end {
-                    return Some(format!("data{}+{}", d.idx, a - start));
-                }
-            }
+        if let Some((idx, start)) = data_seg_lookup(ctx.data_bounds, a) {
+            return Some(format!("data{idx}+{}", a.wrapping_sub(start)));
         }
         return None;
     }
@@ -328,10 +581,7 @@ fn data_note(base: &Expr, mem_offset: u64, is_byte: bool, ctx: &EmitCtx) -> Opti
             _ => return None,
         };
         let total = c.wrapping_add(mem_offset);
-        let s = ctx
-            .strings
-            .iter()
-            .find(|e| total >= e.addr && total < e.addr + e.len as u64)?;
+        let s = str_lookup(ctx.strings, total)?;
         let k = total - s.addr;
         let idx = if k == 0 {
             emit_expr(dyn_part, ctx)
@@ -347,14 +597,21 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
     for s in stmts {
         match s {
             Stmt::Assign { dst, expr } => {
-                // peephole: skip self-assignments like `l3 = l3` (tee lowering residue)
-                if emit_expr(expr, ctx) == *dst {
+                // peephole: skip self-assignments like `l3 = l3` (tee lowering residue).
+                // Structural check (was: render-then-compare, i.e. every RHS
+                // rendered twice) — equivalent: dst names only match bare vars.
+                let self_assign = match expr {
+                    Expr::Local(i) => dst.strip_prefix('l').and_then(|n| n.parse::<u32>().ok()) == Some(*i),
+                    Expr::Tmp(i) => dst.strip_prefix('t').and_then(|n| n.parse::<u32>().ok()) == Some(*i),
+                    _ => false,
+                };
+                if self_assign {
                     continue;
                 }
                 // annotate loads from known data segments (statics/globals)
                 let note = match expr {
                     Expr::Load { base, offset, ty } => {
-                        data_note(base, *offset, ty.contains("w1"), ctx)
+                        data_note(base, *offset, is_byte_ty(ty), ctx)
                             .map(|n| format!(" /* {n} */"))
                             .unwrap_or_default()
                     }
@@ -377,11 +634,11 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                         indent(lvl),
                         emit_expr(value, ctx)
                     ));
-                } else if let Some(acc) = struct_access(base, *offset, ctx) {
+                } else if let Some(acc) = struct_access(base, *offset, load_byte_width(ty), ctx) {
                     out.push_str(&format!("{}{} = {};\n", indent(lvl), acc, emit_expr(value, ctx)));
                 } else if let Expr::ConstI32(a) = base {
                     let total = (*a as i64 as u64).wrapping_add(*offset);
-                    let note = data_note(base, *offset, ty.contains("w1"), ctx)
+                    let note = data_note(base, *offset, is_byte_ty(ty), ctx)
                         .map(|n| format!(" /* {n} */"))
                         .unwrap_or_default();
                     out.push_str(&format!(
@@ -391,7 +648,7 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                     ));
                 } else {
                     let b = emit_expr(base, ctx);
-                    let note = data_note(base, *offset, ty.contains("w1"), ctx)
+                    let note = data_note(base, *offset, is_byte_ty(ty), ctx)
                         .map(|n| format!(" /* {n} */"))
                         .unwrap_or_default();
                     if *offset == 0 {
@@ -445,6 +702,18 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
             Stmt::Loop { label, body } => {
                 out.push_str(&format!("{}__head_{label}: while (1) {{ /* loop {label} */\n", indent(lvl)));
                 emit_stmts(body, out, lvl + 1, ctx);
+                // Wasm `loop` falls through to exit; C `while (1)` does not.
+                // Clang's canonical counted loop ends in `br_if`-continue +
+                // fallthrough exit, so without this the output hangs. Append
+                // `break` unless the body already ends in an unconditional
+                // transfer (goto/switch/return) — then it is dead code.
+                let terminal = matches!(
+                    body.last(),
+                    Some(Stmt::Br { .. } | Stmt::BrTable { .. } | Stmt::Return { .. })
+                );
+                if !terminal {
+                    out.push_str(&format!("{}break; /* loop fallthrough exit */\n", indent(lvl + 1)));
+                }
                 out.push_str(&format!("{}}}\n{}__end_{label}: ;\n", indent(lvl), indent(lvl)));
             }
             Stmt::Br { label, is_loop, .. } => {
@@ -559,7 +828,7 @@ fn collect_ref_labels(stmts: &[Stmt], set: &mut HashSet<String>) {
 fn collect_str_refs_expr(e: &Expr, strings: &[StrEntry], acc: &mut std::collections::BTreeSet<u64>) {
     match e {
         Expr::Load { base, offset, ty } => {
-            if ty.contains("w1") {
+            if is_byte_ty(ty) {
                 let total: Option<u64> = match &**base {
                     Expr::ConstI32(v) => Some((*v as i64 as u64).wrapping_add(*offset)),
                     Expr::ConstI64(v) => Some((*v as u64).wrapping_add(*offset)),
@@ -579,10 +848,7 @@ fn collect_str_refs_expr(e: &Expr, strings: &[StrEntry], acc: &mut std::collecti
                     }
                 };
                 if let Some(t) = total {
-                    if let Some(s) = strings
-                        .iter()
-                        .find(|x| t >= x.addr && t < x.addr + x.len as u64)
-                    {
+                    if let Some(s) = str_lookup(strings, t) {
                         acc.insert(s.addr);
                     }
                 }
@@ -650,11 +916,41 @@ fn collect_str_refs(stmts: &[Stmt], strings: &[StrEntry], acc: &mut std::collect
 }
 
 pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
-    let mut out = String::new();
-    out.push_str("#include <stdint.h>\n#include <stddef.h>\n#include <math.h>\n");
+    // Pre-size the output buffer (perf R5): rough heuristic from counts so
+    // multi-MB outputs (Flare hit 955MB) don't grow via repeated realloc.
+    let access_total: usize = m.funcs.iter().map(|f| f.accesses.len()).sum();
+    let data_total: usize = m.funcs.len() * 512
+        + access_total * 64
+        + m.data.iter().map(|d| d.bytes.len().min(256)).sum::<usize>();
+    let mut out = String::with_capacity(4096 + data_total);
+
+    // Struct layouts computed ONCE per function (perf R4): the old code
+    // called `recover(f)` 4× per func (fwd-decls, struct-defs, layouts,
+    // hints). All consumers below index into this cache.
+    let layouts_all: Vec<Vec<crate::types::StructLayout>> =
+        m.funcs.iter().map(|f| recover(f)).collect();
+
+    // Sorted data-segment bounds for O(log D) address notes (perf R3).
+    let mut data_bounds: Vec<(u64, u64, u32)> = m
+        .data
+        .iter()
+        .filter_map(|d| {
+            d.offset.map(|off| {
+                let s = off as i64 as u64;
+                (s, s.wrapping_add(d.bytes.len() as u64), d.idx)
+            })
+        })
+        .collect();
+    data_bounds.sort();
+
+    out.push_str("#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n#include <math.h>\n");
     out.push_str("typedef unsigned __int128 __v128_u __attribute__((vector_size(16)));\n");
     out.push_str("typedef __v128_u __v128;\n");
     out.push_str("static uint8_t *mem = 0; /* wasm linear memory base (host provides) */\n");
+    out.push_str("static float u32_to_float(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }\n");
+    out.push_str("static double u64_to_double(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }\n");
+    out.push_str("static uint32_t f32_to_u32(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }\n");
+    out.push_str("static uint64_t f64_to_u64(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }\n");
     out.push_str("static uint32_t memory_size(uint32_t m) { (void)m; return 0; }\n");
     out.push_str("static uint32_t memgrow(uint32_t d) { (void)d; return (uint32_t)-1; }\n\n");
 
@@ -699,11 +995,11 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
     }
 
     // forward decls (defined funcs use display names; imported funcs are f<num> stubs)
-    for f in &m.funcs {
+    for (f, layouts) in m.funcs.iter().zip(layouts_all.iter()) {
         // mirror the per-function signature rewrite so decls match definitions
         let mut decl_struct: HashMap<String, String> = HashMap::new();
         if cfg.struct_on {
-            for s in recover(f) {
+            for s in layouts {
                 decl_struct.entry(s.base.clone()).or_insert(s.name.clone());
             }
         }
@@ -724,8 +1020,8 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
     let mut sig_first: HashMap<Vec<u64>, String> = HashMap::new();
     let mut struct_defs: Vec<String> = Vec::new();
     if cfg.struct_on {
-        for f in &m.funcs {
-            for s in recover(f) {
+        for (f, layouts) in m.funcs.iter().zip(layouts_all.iter()) {
+            for s in layouts {
             let mut sig: Vec<u64> = s.fields.iter().map(|x| x.offset).collect();
             sig.sort();
             if let Some(existing) = sig_first.get(&sig) {
@@ -775,7 +1071,7 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
         if !refs.is_empty() {
             out.push_str("/* referenced strings */\n");
             for addr in refs {
-                if let Some(s) = strings.iter().find(|e| e.addr == addr) {
+                if let Some(s) = str_by_addr(&strings, addr) {
                     out.push_str(&format!(
                         "static const char s_{addr}[] = \"{}\"; /* data{}+{} ({}b{}) */\n",
                         s.text,
@@ -790,18 +1086,22 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
         }
     }
 
-    for f in &m.funcs {
+    for (f, flayouts) in m.funcs.iter().zip(layouts_all.iter()) {
         // build struct-access map: "lN+off" -> "((S*)lN)->f_off_O"
-        let mut layouts: HashMap<String, (String, u64)> = HashMap::new();
+        let mut layouts: HashMap<String, (String, u64, u8)> = HashMap::new();
         // base -> struct name (for signature rewrite of pointer params)
         let mut base_struct: HashMap<String, String> = HashMap::new();
         if cfg.struct_on {
-            for s in recover(f) {
+            for s in flayouts {
                 base_struct.entry(s.base.clone()).or_insert(s.name.clone());
                 for fl in &s.fields {
                     layouts.insert(
                         format!("{}+{}", s.base, fl.offset),
-                        (format!("(({}*){})->f_off_{}", s.name, s.base, fl.offset), fl.offset),
+                        (
+                            format!("(({}*){})->f_off_{}", s.name, s.base, fl.offset),
+                            fl.offset,
+                            fl.width,
+                        ),
                     );
                 }
             }
@@ -810,13 +1110,13 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
             let mut extra = Vec::new();
             for (old, new) in &f.aliases {
                 let final_base = resolve_alias(new, &f.aliases);
-                for (k, (text, off)) in &layouts {
+                for (k, (text, off, w)) in &layouts {
                     if let Some(rest) = k.strip_prefix(&format!("{old}+")) {
                         let new_text = text.replace(
                             &format!("){old})->"),
                             &format!("){final_base})->"),
                         );
-                        extra.push((format!("{final_base}+{rest}"), (new_text, *off)));
+                        extra.push((format!("{final_base}+{rest}"), (new_text, *off, *w)));
                     }
                 }
                 // alias the struct name itself for signature rewrite
@@ -862,7 +1162,7 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
             out.push_str(&format!("  int32_t t{t} = 0; /* synthetic (type TODO) */\n"));
         }
         if cfg.struct_on {
-            for s in recover(f) {
+            for s in flayouts {
                 out.push_str(&format!(
                     "  /* hint: {} is {}* ({} fields) */\n",
                     s.base,
@@ -880,6 +1180,7 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
         let ctx = EmitCtx {
             layouts: &layouts,
             data: &m.data,
+            data_bounds: &data_bounds,
             strings: &strings,
             mode: cfg.strings,
             struct_on: cfg.struct_on,
@@ -961,17 +1262,16 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
         }
     }
     out.push_str("/* tables */\n");
+    // func idx -> name once (perf R7): the old per-slot linear scan is
+    // O(slots × funcs) on table-heavy modules.
+    let func_names: HashMap<u32, &str> =
+        m.funcs.iter().map(|f| (f.idx, f.name.as_str())).collect();
     for (ti, tab) in m.tables.iter().enumerate() {
-        let names: Vec<String> = tab
+        let names: Vec<&str> = tab
             .iter()
             .map(|o| {
-                o.and_then(|idx| {
-                    m.funcs
-                        .iter()
-                        .find(|f| f.idx == idx)
-                        .map(|f| f.name.clone())
-                })
-                .unwrap_or("NULL".into())
+                o.and_then(|idx| func_names.get(&idx).copied())
+                    .unwrap_or("NULL")
             })
             .collect();
         out.push_str(&format!("/* table{ti}: [{}] */\n", names.join(", ")));

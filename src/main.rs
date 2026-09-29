@@ -100,7 +100,7 @@ fn main() -> Result<()> {
 
 fn run(args: Args) -> Result<()> {
     let bytes = load_bytes(&args.input)?;
-    let meta = parse::parse_meta(&bytes)?;
+    let mut meta = parse::parse_meta(&bytes)?;
 
     if args.list {
         // No lifting needed: signatures + names come straight from meta,
@@ -142,7 +142,7 @@ fn run(args: Args) -> Result<()> {
         }
         wanted.sort_unstable();
         wanted.dedup();
-        let mut mir = lift::lift_selected(&bodies, &meta, &wanted)?;
+        let mut mir = lift::lift_selected(&bodies, &mut meta, &wanted)?;
         // single-function view: keep only data segments the query touches,
         // otherwise 62k-segment dumps drown the function.
         {
@@ -161,7 +161,7 @@ fn run(args: Args) -> Result<()> {
         }
         mir
     } else {
-        lift::lift_module(&bytes, &meta)?
+        lift::lift_module(&bytes, &mut meta)?
     };
 
     let opt = if args.no_opt {
@@ -220,24 +220,25 @@ fn run(args: Args) -> Result<()> {
                 queue.push_back(r);
             }
         }
-        // adjacency by func idx
+        // adjacency by func idx (neighbor lists pre-sorted once; the old
+        // code cloned + re-sorted per BFS visit)
         let adj: std::collections::HashMap<u32, Vec<u32>> = mir
             .funcs
             .iter()
             .map(|f| {
                 let mut cs = f.calls.clone();
                 cs.extend(f.indirects.iter().flatten());
+                cs.sort_unstable();
+                cs.dedup();
                 (f.idx, cs)
             })
             .collect();
         while let Some(n) = queue.pop_front() {
             if let Some(cs) = adj.get(&n) {
-                let mut cs = cs.clone();
-                cs.sort_unstable();
                 for c in cs {
-                    if !rank.contains_key(&c) {
-                        rank.insert(c, rank.len());
-                        queue.push_back(c);
+                    if !rank.contains_key(c) {
+                        rank.insert(*c, rank.len());
+                        queue.push_back(*c);
                     }
                 }
             }
@@ -305,15 +306,15 @@ mod tests {
 
     fn decompile_wat(wat: &str) -> String {
         let bytes = wat::parse_str(wat).unwrap();
-        let meta = parse::parse_meta(&bytes).unwrap();
-        let mir = lift::lift_module(&bytes, &meta).unwrap();
+        let mut meta = parse::parse_meta(&bytes).unwrap();
+        let mir = lift::lift_module(&bytes, &mut meta).unwrap();
         emit::emit_c(&mir)
     }
 
     fn decompile_opt_wat(wat: &str) -> String {
         let bytes = wat::parse_str(wat).unwrap();
-        let meta = parse::parse_meta(&bytes).unwrap();
-        let mut mir = lift::lift_module(&bytes, &meta).unwrap();
+        let mut meta = parse::parse_meta(&bytes).unwrap();
+        let mut mir = lift::lift_module(&bytes, &mut meta).unwrap();
         for f in mir.funcs.iter_mut() {
             passes::optimize_func(f);
         }
@@ -326,8 +327,8 @@ mod tests {
         ecfg: &emit::EmitConfig,
     ) -> String {
         let bytes = wat::parse_str(wat).unwrap();
-        let meta = parse::parse_meta(&bytes).unwrap();
-        let mut mir = lift::lift_module(&bytes, &meta).unwrap();
+        let mut meta = parse::parse_meta(&bytes).unwrap();
+        let mut mir = lift::lift_module(&bytes, &mut meta).unwrap();
         for f in mir.funcs.iter_mut() {
             passes::optimize_func_with(f, opt);
         }
@@ -501,12 +502,20 @@ mod tests {
           (func (param i32) (result i64)
             (i64.load32_u (local.get 0))))"#);
         assert!(
-            c.contains("*(int32_t*)"),
-            "expected 4-byte load, got:\n{c}"
+            c.contains("*(uint32_t*)"),
+            "expected 4-byte unsigned load, got:\n{c}"
         );
         assert!(
             !c.contains("*(int64_t*)"),
             "must not widen to 8 bytes, got:\n{c}"
+        );
+        // signed variant sign-extends instead
+        let cs = decompile_opt_wat(r#"(module (memory 1)
+          (func (param i32) (result i64)
+            (i64.load32_s (local.get 0))))"#);
+        assert!(
+            cs.contains("*(int32_t*)"),
+            "expected 4-byte signed load, got:\n{cs}"
         );
     }
 
@@ -530,5 +539,113 @@ mod tests {
             (block (block (block (i32.add (local.get 0) (i32.const 1)))))))"#);
         assert!(!c.contains("B2") && !c.contains("B3"), "expected flattened, got:\n{c}");
         assert!(c.contains("return (l0 + 1)"), "expected value, got:\n{c}");
+    }
+
+    #[test]
+    fn loop_fallthrough_exits() {
+        // Clang counted-loop shape: br_if-continue + fallthrough exit.
+        // Without a trailing break the C `while (1)` hangs (fac/control).
+        let c = decompile_opt_wat(r#"(module
+          (func (param i32) (result i32) (local i32)
+            (local.set 1 (i32.const 0))
+            (block (loop
+              (br_if 1 (i32.ge_s (local.get 1) (local.get 0)))
+              (local.set 1 (i32.add (local.get 1) (i32.const 1)))
+              (br 0)))
+            (local.get 1)))"#);
+        assert!(c.contains("break;"), "expected loop-exit break, got:\n{c}");
+    }
+
+    #[test]
+    fn indirect_operand_order() {
+        // (call_indirect (type $t) (local.get 1) (local.get 0)):
+        // stack is [arg=l1, index=l0]; index must stay the table key.
+        let c = decompile_opt_wat(r#"(module
+          (type $t (func (param i32) (result i32)))
+          (table 2 funcref)
+          (elem (i32.const 0) $a $b)
+          (func $a (param i32) (result i32) (i32.add (local.get 0) (i32.const 1)))
+          (func $b (param i32) (result i32) (i32.mul (local.get 0) (i32.const 2)))
+          (func (export "run") (param i32 i32) (result i32)
+            (call_indirect (type $t) (local.get 1) (local.get 0))))"#);
+        assert!(c.contains("table_call(l0)(l1)"), "expected index l0, got:\n{c}");
+    }
+
+    #[test]
+    fn unsigned_cmp_and_shift() {
+        // *_u ops need unsigned C semantics (plain > and >> are signed).
+        let c = decompile_opt_wat(r#"(module
+          (func (param i32 i32) (result i32)
+            (i32.gt_u (local.get 0) (local.get 1))))"#);
+        assert!(c.contains("(uint32_t)(l0) > (uint32_t)(l1)"), "expected unsigned compare, got:\n{c}");
+        let c2 = decompile_opt_wat(r#"(module
+          (func (param i32 i32) (result i32)
+            (i32.shr_u (local.get 0) (local.get 1))))"#);
+        assert!(c2.contains("(uint32_t)(l0) >>"), "expected logical shift, got:\n{c2}");
+        let c3 = decompile_opt_wat(r#"(module (memory 1)
+          (func (param i32) (result i32) (i32.load8_u (local.get 0))))"#);
+        assert!(c3.contains("*(uint8_t*)"), "expected zero-extending load, got:\n{c3}");
+        let c4 = decompile_opt_wat(r#"(module (memory 1)
+          (func (param i32) (result i32) (i32.load8_s (local.get 0))))"#);
+        assert!(c4.contains("*(int8_t*)"), "expected sign-extending load, got:\n{c4}");
+    }
+
+    #[test]
+    fn br_carries_block_value() {
+        // (block (result i32) (br 0 (5)) (6)) must yield 5, not 6.
+        let c = decompile_opt_wat(r#"(module
+          (func (result i32)
+            (block (result i32) (br 0 (i32.const 5)) (i32.const 6))))"#);
+        assert!(c.contains("t0 = 5") && c.contains("return t0"), "expected phi merge, got:\n{c}");
+        assert!(!c.contains("return 6"), "must not take fallthrough, got:\n{c}");
+    }
+
+    #[test]
+    fn array_new_len_init_order() {
+        // Stack is [init, len] with len on top; rendering is (len, init).
+        let c = decompile_opt_wat(r#"(module
+          (type $a (array i32))
+          (func (param i32 i32) (result anyref)
+            (array.new $a (local.get 0) (local.get 1))))"#);
+        assert!(c.contains("array.new(l1, l0,"), "expected (len, init) order, got:\n{c}");
+    }
+
+    #[test]
+    fn nonfinite_float_consts() {
+        // inf/NaN must not render as integer-to-float casts (miscompile).
+        let c = decompile_opt_wat(r#"(module
+          (func (result f32) (f32.const inf)))"#);
+        assert!(c.contains("INFINITY") && !c.contains("0x7f800000"), "expected INFINITY, got:\n{c}");
+        let c2 = decompile_opt_wat(r#"(module
+          (func (result f64) (f64.const -nan:0x12345)))"#);
+        assert!(c2.contains("u64_to_double"), "expected bit-preserving NaN, got:\n{c2}");
+    }
+
+    #[test]
+    fn stale_copy_not_propagated() {
+        // l1=l0, then l0 clobbered, then use l1: must keep the copy.
+        let c = decompile_opt_wat(r#"(module
+          (func (param i32) (result i32) (local i32)
+            (local.set 1 (local.get 0))
+            (local.set 0 (i32.const 99))
+            (local.get 1)))"#);
+        assert!(c.contains("l1 = l0") || c.contains("return l1"), "expected copy kept, got:\n{c}");
+        assert!(!c.contains("return 99"), "must not use clobbered value, got:\n{c}");
+    }
+
+    #[test]
+    fn narrow_store_not_widened() {
+        // i32 store at +0 with a dominant i64 field there must not render
+        // through the 8-byte field (fill_blob: tag store via f_off_0).
+        let c = decompile_opt_wat(r#"(module (memory 1)
+          (func (param i32 i32)
+            (i64.store (local.get 0) (i64.const 1))
+            (i64.store (local.get 0) (i64.const 2))
+            (i64.store offset=8 (local.get 0) (i64.const 3))
+            (i32.store (local.get 0) (local.get 1))))"#);
+        assert!(
+            c.contains("*(int32_t*)(mem + (l0)) = l1"),
+            "expected raw narrow store, got:\n{c}"
+        );
     }
 }
