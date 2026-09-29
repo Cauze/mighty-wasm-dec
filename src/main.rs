@@ -55,6 +55,9 @@ struct Args {
     /// string display: off | comment | defs (static const table + s_<addr> refs)
     #[arg(long, default_value = "comment")]
     strings: String,
+    /// cap visual nesting depth (levels of 2 spaces); unlimited by default
+    #[arg(long)]
+    max_indent: Option<usize>,
     /// emission order: index | calls (BFS from exports, runtime sinks last)
     #[arg(long, default_value = "index")]
     order: String,
@@ -190,6 +193,7 @@ fn run(args: Args) -> Result<()> {
     let ecfg = emit::EmitConfig {
         struct_on: !args.no_struct,
         strings: strings_mode,
+        max_indent: args.max_indent,
     };
 
     if args.list {
@@ -443,6 +447,7 @@ mod tests {
         let cfg = emit::EmitConfig {
             struct_on: true,
             strings: emit::StringsMode::Defs,
+            max_indent: None,
         };
         let c = decompile_cfg_wat(
             r#"(module (memory 1)
@@ -478,6 +483,7 @@ mod tests {
         let cfg = emit::EmitConfig {
             struct_on: false,
             strings: emit::StringsMode::Comment,
+            max_indent: None,
         };
         let c = decompile_cfg_wat(wat, &passes::OptConfig::default(), &cfg);
         assert!(!c.contains("typedef struct"), "expected no structs, got:\n{c}");
@@ -631,6 +637,35 @@ mod tests {
             (local.get 1)))"#);
         assert!(c.contains("l1 = l0") || c.contains("return l1"), "expected copy kept, got:\n{c}");
         assert!(!c.contains("return 99"), "must not use clobbered value, got:\n{c}");
+    }
+
+    #[test]
+    fn max_indent_caps_nesting() {
+        // Referenced labels survive all passes, so the `goto` sits 4 deep
+        // (8 spaces) unless capped.
+        let wat = r#"(module
+          (func (param i32) (result i32)
+            (block $exit
+              (loop $l
+                (if (i32.eqz (local.get 0)) (then (br $exit)))
+                (br $l)))
+            (i32.const 7)))"#;
+        let off = passes::OptConfig::all_off();
+        let plain = emit::EmitConfig {
+            struct_on: true,
+            strings: emit::StringsMode::Comment,
+            max_indent: None,
+        };
+        let uncapped = decompile_cfg_wat(wat, &off, &plain);
+        assert!(uncapped.contains("\n        goto"), "expected 8-space indent, got:\n{uncapped}");
+        let cfg = emit::EmitConfig {
+            struct_on: true,
+            strings: emit::StringsMode::Comment,
+            max_indent: Some(1),
+        };
+        let capped = decompile_cfg_wat(wat, &off, &cfg);
+        assert!(!capped.contains("\n        goto"), "expected capped indent, got:\n{capped}");
+        assert!(capped.contains("goto __end_"), "expected goto kept, got:\n{capped}");
     }
 
     #[test]

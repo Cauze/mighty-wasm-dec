@@ -13,11 +13,13 @@ pub enum StringsMode {
     Defs,
 }
 
-/// Emitter view switches (`--no-struct`, `--strings=`).
+/// Emitter view switches (`--no-struct`, `--strings=`, `--max-indent`).
 #[derive(Debug, Clone)]
 pub struct EmitConfig {
     pub struct_on: bool,
     pub strings: StringsMode,
+    /// Cap visual nesting depth (`--max-indent N`); None = unlimited.
+    pub max_indent: Option<usize>,
 }
 
 impl Default for EmitConfig {
@@ -25,6 +27,7 @@ impl Default for EmitConfig {
         EmitConfig {
             struct_on: true,
             strings: StringsMode::Comment,
+            max_indent: None,
         }
     }
 }
@@ -108,6 +111,8 @@ struct EmitCtx<'a> {
     strings: &'a [StrEntry],
     mode: StringsMode,
     struct_on: bool,
+    /// optional visual-nesting cap (None = unlimited)
+    max_indent: Option<usize>,
     /// labels targeted by goto (for collapsing unreferenced blocks)
     ref_labels: &'a HashSet<String>,
 }
@@ -124,11 +129,15 @@ fn data_seg_lookup(bounds: &[(u64, u64, u32)], addr: u64) -> Option<(u32, u64)> 
     (addr < e).then_some((idx, s))
 }
 
-fn indent(n: usize) -> String {
-    // Cap visual nesting: real modules nest ~1000 deep via dispatch
-    // scaffolding. Whitespace carries no semantics in C and labels
-    // disambiguate scopes, so clamp to keep lines on screen.
-    "  ".repeat(n.min(32))
+fn indent(n: usize, cap: Option<usize>) -> String {
+    // Optional visual-nesting cap: real modules nest ~1000 deep via
+    // dispatch scaffolding. Whitespace carries no semantics in C and labels
+    // disambiguate scopes, so `--max-indent 32` keeps lines on screen.
+    // Unlimited by default (faithful nesting).
+    match cap {
+        Some(m) => "  ".repeat(n.min(m)),
+        None => "  ".repeat(n),
+    }
 }
 
 fn load_byte_width(ty: &str) -> u8 {
@@ -617,7 +626,7 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                     }
                     _ => String::new(),
                 };
-                out.push_str(&format!("{}{} = {};{note}\n", indent(lvl), dst, emit_expr(expr, ctx)));
+                out.push_str(&format!("{}{} = {};{note}\n", indent(lvl, ctx.max_indent), dst, emit_expr(expr, ctx)));
             }
             Stmt::Store { ty, base, offset, value } => {
                 let ct = c_ty_of_load(ty);
@@ -631,11 +640,11 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                     };
                     out.push_str(&format!(
                         "{}atomic.store({addr}, {});\n",
-                        indent(lvl),
+                        indent(lvl, ctx.max_indent),
                         emit_expr(value, ctx)
                     ));
                 } else if let Some(acc) = struct_access(base, *offset, load_byte_width(ty), ctx) {
-                    out.push_str(&format!("{}{} = {};\n", indent(lvl), acc, emit_expr(value, ctx)));
+                    out.push_str(&format!("{}{} = {};\n", indent(lvl, ctx.max_indent), acc, emit_expr(value, ctx)));
                 } else if let Expr::ConstI32(a) = base {
                     let total = (*a as i64 as u64).wrapping_add(*offset);
                     let note = data_note(base, *offset, is_byte_ty(ty), ctx)
@@ -643,7 +652,7 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                         .unwrap_or_default();
                     out.push_str(&format!(
                         "{}*({ct}*)(mem + {total}) = {};{note}\n",
-                        indent(lvl),
+                        indent(lvl, ctx.max_indent),
                         emit_expr(value, ctx)
                     ));
                 } else {
@@ -654,29 +663,29 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                     if *offset == 0 {
                         out.push_str(&format!(
                             "{}*({ct}*)(mem + ({b})) = {};{note}\n",
-                            indent(lvl),
+                            indent(lvl, ctx.max_indent),
                             emit_expr(value, ctx)
                         ));
                     } else {
                         out.push_str(&format!(
                             "{}*({ct}*)(mem + ({b}) + {offset}) = {};{note}\n",
-                            indent(lvl),
+                            indent(lvl, ctx.max_indent),
                             emit_expr(value, ctx)
                         ));
                     }
                 }
             }
             Stmt::ExprStmt(e) => {
-                out.push_str(&format!("{}{};\n", indent(lvl), emit_expr(e, ctx)));
+                out.push_str(&format!("{}{};\n", indent(lvl, ctx.max_indent), emit_expr(e, ctx)));
             }
             Stmt::If { cond, then_b, else_b } => {
-                out.push_str(&format!("{}if ({}) {{\n", indent(lvl), emit_expr(cond, ctx)));
+                out.push_str(&format!("{}if ({}) {{\n", indent(lvl, ctx.max_indent), emit_expr(cond, ctx)));
                 emit_stmts(then_b, out, lvl + 1, ctx);
                 if !else_b.is_empty() {
-                    out.push_str(&format!("{}}} else {{\n", indent(lvl)));
+                    out.push_str(&format!("{}}} else {{\n", indent(lvl, ctx.max_indent)));
                     emit_stmts(else_b, out, lvl + 1, ctx);
                 }
-                out.push_str(&format!("{}}}\n", indent(lvl)));
+                out.push_str(&format!("{}}}\n", indent(lvl, ctx.max_indent)));
             }
             Stmt::Block { label, body } => {
                 // unreferenced labels with straight-line bodies collapse to braces
@@ -686,21 +695,21 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                     Some(Stmt::Br { .. } | Stmt::BrIf { .. } | Stmt::BrTable { .. })
                 );
                 if !referenced && !ends_in_goto {
-                    out.push_str(&format!("{}/* block */ {{\n", indent(lvl)));
+                    out.push_str(&format!("{}/* block */ {{\n", indent(lvl, ctx.max_indent)));
                     emit_stmts(body, out, lvl + 1, ctx);
-                    out.push_str(&format!("{}}}\n", indent(lvl)));
+                    out.push_str(&format!("{}}}\n", indent(lvl, ctx.max_indent)));
                 } else {
-                    out.push_str(&format!("{}do {{ /* block {label} */\n", indent(lvl)));
+                    out.push_str(&format!("{}do {{ /* block {label} */\n", indent(lvl, ctx.max_indent)));
                     emit_stmts(body, out, lvl + 1, ctx);
                     out.push_str(&format!(
                         "{}}} while (0);\n{}__end_{label}: ;\n",
-                        indent(lvl),
-                        indent(lvl)
+                        indent(lvl, ctx.max_indent),
+                        indent(lvl, ctx.max_indent)
                     ));
                 }
             }
             Stmt::Loop { label, body } => {
-                out.push_str(&format!("{}__head_{label}: while (1) {{ /* loop {label} */\n", indent(lvl)));
+                out.push_str(&format!("{}__head_{label}: while (1) {{ /* loop {label} */\n", indent(lvl, ctx.max_indent)));
                 emit_stmts(body, out, lvl + 1, ctx);
                 // Wasm `loop` falls through to exit; C `while (1)` does not.
                 // Clang's canonical counted loop ends in `br_if`-continue +
@@ -712,41 +721,41 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                     Some(Stmt::Br { .. } | Stmt::BrTable { .. } | Stmt::Return { .. })
                 );
                 if !terminal {
-                    out.push_str(&format!("{}break; /* loop fallthrough exit */\n", indent(lvl + 1)));
+                    out.push_str(&format!("{}break; /* loop fallthrough exit */\n", indent(lvl + 1, ctx.max_indent)));
                 }
-                out.push_str(&format!("{}}}\n{}__end_{label}: ;\n", indent(lvl), indent(lvl)));
+                out.push_str(&format!("{}}}\n{}__end_{label}: ;\n", indent(lvl, ctx.max_indent), indent(lvl, ctx.max_indent)));
             }
             Stmt::Br { label, is_loop, .. } => {
                 if *is_loop {
-                    out.push_str(&format!("{}goto __head_{label}; /* continue */\n", indent(lvl)));
+                    out.push_str(&format!("{}goto __head_{label}; /* continue */\n", indent(lvl, ctx.max_indent)));
                 } else {
-                    out.push_str(&format!("{}goto __end_{label}; /* break */\n", indent(lvl)));
+                    out.push_str(&format!("{}goto __end_{label}; /* break */\n", indent(lvl, ctx.max_indent)));
                 }
             }
             Stmt::BrIf { label, is_loop, cond, .. } => {
                 if *is_loop {
                     out.push_str(&format!(
                         "{}if ({}) goto __head_{label};\n",
-                        indent(lvl),
+                        indent(lvl, ctx.max_indent),
                         emit_expr(cond, ctx)
                     ));
                 } else {
                     out.push_str(&format!(
                         "{}if ({}) goto __end_{label};\n",
-                        indent(lvl),
+                        indent(lvl, ctx.max_indent),
                         emit_expr(cond, ctx)
                     ));
                 }
             }
             Stmt::BrTable { index, targets, default } => {
-                out.push_str(&format!("{}switch ({}) {{\n", indent(lvl), emit_expr(index, ctx)));
+                out.push_str(&format!("{}switch ({}) {{\n", indent(lvl, ctx.max_indent), emit_expr(index, ctx)));
                 for (i, (_, label, is_loop)) in targets.iter().enumerate() {
                     let dst = if *is_loop {
                         format!("__head_{label}")
                     } else {
                         format!("__end_{label}")
                     };
-                    out.push_str(&format!("{}case {i}: goto {dst};\n", indent(lvl + 1)));
+                    out.push_str(&format!("{}case {i}: goto {dst};\n", indent(lvl + 1, ctx.max_indent)));
                 }
                 let (_, dlabel, dis_loop) = default;
                 let dst = if *dis_loop {
@@ -754,21 +763,21 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                 } else {
                     format!("__end_{dlabel}")
                 };
-                out.push_str(&format!("{}default: goto {dst};\n", indent(lvl + 1)));
-                out.push_str(&format!("{}}}\n", indent(lvl)));
+                out.push_str(&format!("{}default: goto {dst};\n", indent(lvl + 1, ctx.max_indent)));
+                out.push_str(&format!("{}}}\n", indent(lvl, ctx.max_indent)));
             }
             Stmt::Return { values } => {
                 if values.is_empty() {
-                    out.push_str(&format!("{}return;\n", indent(lvl)));
+                    out.push_str(&format!("{}return;\n", indent(lvl, ctx.max_indent)));
                 } else {
                     // Patch loads inside return through struct-access map is handled
                     // at Expr level only for stores; keep loads raw but correct.
                     let v: Vec<String> = values.iter().map(|x| emit_expr(x, ctx)).collect();
-                    out.push_str(&format!("{}return {};\n", indent(lvl), v.join(", ")));
+                    out.push_str(&format!("{}return {};\n", indent(lvl, ctx.max_indent), v.join(", ")));
                 }
             }
             Stmt::Comment(c) => {
-                out.push_str(&format!("{}/* {c} */\n", indent(lvl)));
+                out.push_str(&format!("{}/* {c} */\n", indent(lvl, ctx.max_indent)));
             }
         }
     }
@@ -1184,6 +1193,7 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
             strings: &strings,
             mode: cfg.strings,
             struct_on: cfg.struct_on,
+            max_indent: cfg.max_indent,
             ref_labels: &ref_labels,
         };
         emit_stmts(&f.body, &mut out, 1, &ctx);

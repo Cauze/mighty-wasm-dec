@@ -32,6 +32,7 @@ Accepts `.wasm` and `.wat` (compiled in-memory via `wat` crate).
 --no-opt          skip all passes               --no-fold/--no-inline/--no-dce/--no-simplify/--no-struct
 --no-strings      no per-access notes           --strings=off|comment|defs (default comment)
 --order=index|calls  emission order (default index)
+--max-indent <N>  cap visual nesting depth (unlimited by default)
 ```
 
 `--user-only` is name-based: on stripped binaries (all `fN`) it only drops
