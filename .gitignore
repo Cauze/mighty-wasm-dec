@@ -1,2 +1,6 @@
 /target
 .gitconfig
+# generated outputs: sample dumps, corpus build artifacts
+/out/
+/corpus/decompiled/
+/corpus/wasm/*.wasm

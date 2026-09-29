@@ -9,12 +9,13 @@ readability and accuracy are.
 * `src/*.c` — 15 focused sources (`fac`, `struct`, `call`, `indirect`,
   `strings`, `switch`, `globals`, `array`, `float`, `intops`, `conv`,
   `memory`, `control`, `recursion`, `simd` — the last built with `-msimd128`)
-* `wat/*.wat` — 7 hand-written proposal files (`simd`, `atomic`, `bulk`,
-  `refs`, `tail`, `gc`, `except`) for ops C can't easily emit; no toolchain
-  needed (decompiler reads `.wat` directly)
-* `wasm/*.wasm` — built artifacts (checked in so tests run without Docker)
+* `wat/*.wat` — 15 hand-written files, no toolchain (read directly):
+  `mvp-01..08` core cases (loop, struct, calls, indirect, memory, stack,
+  br_table, strings) + 7 proposal files (`simd`, `atomic`, `bulk`,
+  `refs`, `tail`, `gc`, `except`)
+* `wasm/*.wasm` — build artifacts (gitignored; rebuild via woodpecker, see below)
 * `wasm/BUILD.txt` — toolchain + flags record
-* `decompiled/*.c` — expected decompiler outputs for the C files (checked in)
+* `decompiled/*.c` — expected decompiler outputs for the C files (gitignored; regenerate locally, see below)
 * `COVERAGE.md` — opcode group × status table
 
 ## Rebuilding

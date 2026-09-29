@@ -13,7 +13,7 @@ struct-field rendering, and string modes.
 
 ```
 cargo build --release
-./target/release/mighty-wasm-dec.exe samples/01-fac.wat
+./target/release/mighty-wasm-dec.exe corpus/wat/mvp-01-fac.wat
 ./target/release/mighty-wasm-dec.exe --list corpus/wasm/indirect.wasm
 ./target/release/mighty-wasm-dec.exe --func-name fac corpus/wasm/fac.wasm
 ./target/release/mighty-wasm-dec.exe --user-only --order=calls corpus/wasm/indirect.wasm
@@ -37,18 +37,13 @@ Accepts `.wasm` and `.wat` (compiled in-memory via `wat` crate).
 `--user-only` is name-based: on stripped binaries (all `fN`) it only drops
 empty stubs — use `--order=calls` + `--func-name` to navigate those.
 
-## Samples (8)
+## Test inputs (`corpus/`)
 
-* `01-fac` — loop/branch lowering, implicit return recovery
-* `02-struct` — `typedef struct S_0_l0` + `((S*)l0)->f_off_N` stores
-* `03-ifelse-call` — if/else with result phi, direct calls
-* `04-indirect` — table snapshot `[f0,f1]`, `call_indirect`
-* `05-memory` — byte load via `mem`
-* `06-stack` — Emscripten-style `g0` stack frame + `S_0_l1` + SP note
-* `07-brtable` — `switch` with resolved labels
-* `08-strings` — data segments rendered (`"auth-ok"`, binary preview)
-
-Outputs in `out/*.c`.
+* `corpus/wat/mvp-01..08` — hand-written core cases (loop, struct, calls,
+  indirect, memory, stack frame, br_table, strings). Instant, no toolchain.
+* `corpus/wat/{simd,atomic,bulk,refs,tail,gc,except}` — proposal coverage.
+* `corpus/src/*.c` → `corpus/wasm/*.wasm` — real Emscripten builds
+  (see `corpus/README.md`).
 
 ## Limits (honest)
 

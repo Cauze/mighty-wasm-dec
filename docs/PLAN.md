@@ -62,17 +62,20 @@ typedef struct { int32_t x; int32_t y; } S0;
 void f(S0 *p) { p->y++; }
 ```
 
-## 5. Samples (samples/)
+## 5. Hand-written inputs (now `corpus/wat/mvp-*`; was `samples/`)
 
 Hand-written WAT -> .wasm via `wat` crate (no toolchain needed):
-* `01-fac.wat` — loop + locals (fact iterative)
-* `02-struct.wat` — `base+0/4` load/store struct pattern
-* `03-ifelse-call.wat` — if/else + direct call
-* `04-indirect.wat` — table + call_indirect with const index
-* `05-memory.wat` — data segment + string xref pattern
-* `06-stack.wat` — Emscripten-style `g0` stack frame + SROA hint [phase 2]
-* `07-brtable.wat` — `br_table` -> `switch` with resolved labels [phase 2]
-* `08-strings.wat` — printable vs binary data rendering [phase 2]
+* `mvp-01-fac.wat` — loop + locals (fact iterative)
+* `mvp-02-struct.wat` — `base+0/4` load/store struct pattern
+* `mvp-03-ifelse-call.wat` — if/else + direct call
+* `mvp-04-indirect.wat` — table + call_indirect with const index
+* `mvp-05-memory.wat` — data segment + string xref pattern
+* `mvp-06-stack.wat` — Emscripten-style `g0` stack frame + SROA hint [phase 2]
+* `mvp-07-brtable.wat` — `br_table` -> `switch` with resolved labels [phase 2]
+* `mvp-08-strings.wat` — printable vs binary data rendering [phase 2]
+
+Merged into `corpus/wat/` 2026-09-29 (separate `samples/` dir removed);
+proposal files (`simd`, `atomic`, …) live alongside under the same scheme.
 
 CLI accepts `.wat` directly (compiles in-memory) and `.wasm`.
 
@@ -152,9 +155,9 @@ Next: SSA/MemorySSA middle end, Retypd-lite, SROA notes for `g0`.
 
 ```
 cargo build --release
-cargo run -- samples/01-fac.wat
-cargo run -- samples/02-struct.wat --func 0
-cargo run -- samples/04-indirect.wat --json   # dossier for LLMs
+cargo run -- corpus/wat/mvp-01-fac.wat
+cargo run -- corpus/wat/mvp-02-struct.wat --func 0
+cargo run -- corpus/wat/mvp-04-indirect.wat --json   # dossier for LLMs
 cargo test   # lifter + struct-recovery unit tests
 ```
 
