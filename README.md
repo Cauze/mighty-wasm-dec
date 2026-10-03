@@ -52,7 +52,9 @@ empty stubs — use `--order=calls` + `--func-name` to navigate those.
 * Indirect resolves only on const index; dynamic vtables stay unresolved (honest `null`).
 * SIMD/atomic/GC → named pseudo-calls (`i8x16.add`, `atomic.load`,
   `struct.new`), never guessed; see `corpus/COVERAGE.md`.
-* Synthetic `tN` are `int32_t` heuristic; widths/signedness not C-correct yet.
+* Synthetic `tN` are declared `int32_t` (heuristic); load/store widths and
+  signedness are explicit at each access (`uint8_t`, `*(uint32_t*)`,
+  unsigned compares/shifts/divides).
 * Output is readable pseudo-C; recompilability is not a goal.
 
 ## Using as a library
@@ -88,6 +90,11 @@ See `examples/const_on_right.rs` (commutative canonicalization) and
 Real Emscripten builds live in `corpus/` (see `corpus/README.md`):
 `src/*.c`, `wasm/*.wasm` (+`BUILD.txt`), `decompiled/*.c` expected outputs,
 built via `woodpecker-cli exec --backend-engine docker .woodpecker/corpus.yml`.
+Opt-in large target: SQLite (`corpus/wasm/sqlite3.wasm`, 4265 funcs) via
+`.woodpecker/corpus-sqlite.yml`. Also exercised: `lua_worker.wasm` (896
+funcs), Flare `main.wasm` (3255 funcs).
 
-Next: `cfglib`/`analyssa` SSA + MemorySSA, Retypd-lite constraints,
-recompilable emitter, large Emscripten binary test.
+Next: typed `Var` ids (replacing `"l{i}"` strings), `Expr` method surface,
+CFG/dominator analysis for path-sensitive passes, inter-proc pass
+scheduling, remaining coverage gaps (legacy exceptions, stack-switching —
+see `corpus/COVERAGE.md`).
