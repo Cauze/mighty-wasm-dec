@@ -141,22 +141,10 @@ fn run(args: Args) -> Result<()> {
         wanted.sort_unstable();
         wanted.dedup();
         let mut mir = lift::lift_selected(&bodies, &mut meta, &wanted)?;
-        // single-function view: keep only data segments the query touches,
-        // otherwise 62k-segment dumps drown the function.
-        {
-            let mut addrs = Vec::new();
-            for f in &mir.funcs {
-                emit::collect_data_addrs(&f.body, &mut addrs);
-            }
-            mir.data.retain(|d| match d.offset {
-                Some(off) => {
-                    let s = off as i64 as u64;
-                    let e = s.wrapping_add(d.bytes.len() as u64);
-                    addrs.iter().any(|a| *a >= s && *a < e)
-                }
-                None => true,
-            });
-        }
+        // single-function view: trim the world to what the query touches,
+        // otherwise 62k-segment dumps and 241-global preambles drown a
+        // ~70-line function (sqlite3DecOrHexToI64 was 94KB, 82 of it data).
+        emit::trim_for_scoped_view(&mut mir);
         mir
     } else {
         lift::lift_module(&bytes, &mut meta)?
@@ -677,6 +665,62 @@ mod tests {
         let capped = decompile_cfg_wat(wat, &off, &cfg);
         assert!(!capped.contains("\n        goto"), "expected capped indent, got:\n{capped}");
         assert!(capped.contains("goto __end_"), "expected goto kept, got:\n{capped}");
+    }
+
+    #[test]
+    fn range_idiom_folds() {
+        // clang merges `x == 0 || x > MAX` into `(x-K) <u (2^w-K+1)`;
+        // restore the readable disjunction (unsigned `>` stays unsigned).
+        let c = decompile_opt_wat(r#"(module
+          (func (param i64) (result i32)
+            (i64.lt_u
+              (i64.sub (local.get 0) (i64.const 2147483392))
+              (i64.const -2147483391))))"#);
+        assert!(c.contains("||"), "expected disjunction, got:\n{c}");
+        assert!(c.contains("== 0"), "expected null check, got:\n{c}");
+        assert!(c.contains("uint64_t"), "expected unsigned compare, got:\n{c}");
+        // non-idiom shapes must not rewrite (C1+C2 != 1 here)
+        let c2 = decompile_opt_wat(r#"(module
+          (func (param i64) (result i32)
+            (i64.lt_u
+              (i64.sub (local.get 0) (i64.const 100))
+              (i64.const 200))))"#);
+        assert!(!c2.contains("||"), "must not rewrite, got:\n{c2}");
+    }
+
+    #[test]
+    fn scoped_trim_drops_unreferenced() {
+        // Dynamic-only access: no const addrs, no globals -> everything trimmed.
+        let bytes = wat::parse_str(r#"(module (memory 1)
+          (global $g (mut i32) (i32.const 0))
+          (data (i32.const 100) "hello-world")
+          (func (param i32) (result i32) (i32.load8_u (local.get 0))))"#)
+        .unwrap();
+        let mut meta = parse::parse_meta(&bytes).unwrap();
+        let mut mir = lift::lift_module(&bytes, &mut meta).unwrap();
+        emit::trim_for_scoped_view(&mut mir);
+        assert!(mir.data.is_empty(), "expected no segments, got {:?}", mir.data.len());
+        assert!(mir.globals.is_empty(), "expected no globals");
+    }
+
+    #[test]
+    fn scoped_trim_keeps_referenced_range() {
+        // Const load at 1100 in a 2000-byte segment at 1000 + global use:
+        // segment survives trimmed (1100-256 .. 1100+256), global survives.
+        let mut data = "(module (memory 1) (global $g (mut i32) (i32.const 0)) (data (i32.const 1000) \"".to_string();
+        data.push_str(&"ab".repeat(1000));
+        data.push_str("\") (func (result i32) (i32.add (i32.load8_u (i32.const 1500)) (global.get 0))))");
+        let bytes = wat::parse_str(&data).unwrap();
+        let mut meta = parse::parse_meta(&bytes).unwrap();
+        let mut mir = lift::lift_module(&bytes, &mut meta).unwrap();
+        emit::trim_for_scoped_view(&mut mir);
+        assert_eq!(mir.data.len(), 1, "expected one segment");
+        assert_eq!(mir.data[0].offset, Some(1244));
+        assert_eq!(mir.data[0].bytes.len(), 513);
+        assert_eq!(mir.globals.len(), 1, "expected used global kept");
+        // notes still resolve inside the trimmed window
+        let c = emit::emit_c(&mir);
+        assert!(c.contains("mem + (1500)") || c.contains("1500"), "expected addr note, got:\n{c}");
     }
 
     #[test]

@@ -266,6 +266,121 @@ fn fold_i64(op: &str, a: i64, b: i64) -> Option<i64> {
     }
 }
 
+/// Strip conversion-cast wrappers (`(uint32_t)`, `(int64_t)`, …) to the
+/// core expression. Used by idiom matching; casts are pure so stripping
+/// for *recognition* is sound (the rewrite re-casts as needed).
+fn strip_casts(e: &Expr) -> &Expr {
+    let mut cur = e;
+    loop {
+        match cur {
+            Expr::Unop { op, v }
+                if (op.starts_with("(u") || op.starts_with("(i"))
+                    && op.ends_with(')') =>
+            {
+                cur = v;
+            }
+            _ => return cur,
+        }
+    }
+}
+
+fn fold_range_idiom(op: &str, l: &Expr, r: &Expr) -> Option<Expr> {
+    // Two spellings of the same compare: explicit `(uintN)` casts around a
+    // plain `<` (hand-written/lenient producers), or our own `<uN` op which
+    // carries the casts implicitly (from `*_lt_u` wasm ops).
+    let (w, inner, c2) = if op == "<" {
+        match (l, r) {
+            (
+                Expr::Unop { op: lc, v: li },
+                Expr::Unop { op: rc, v: rv },
+            ) if lc == "(uint32_t)" && rc == "(uint32_t)" => match **rv {
+                Expr::ConstI32(c) => (4u32, &**li, c as u32 as u64),
+                _ => return None,
+            },
+            (
+                Expr::Unop { op: lc, v: li },
+                Expr::Unop { op: rc, v: rv },
+            ) if lc == "(uint64_t)" && rc == "(uint64_t)" => match **rv {
+                Expr::ConstI64(c) => (8u32, &**li, c as u64),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    } else if op == "<u32" || op == "<u64" {
+        let w = if op == "<u32" { 4 } else { 8 };
+        let c = match (w, r) {
+            (4, Expr::ConstI32(c)) => *c as u32 as u64,
+            (8, Expr::ConstI64(c)) => *c as u64,
+            _ => return None,
+        };
+        (w as u32, l, c)
+    } else {
+        return None;
+    };
+    let mask: u64 = if w == 4 { 0xffff_ffff } else { 0xffff_ffff_ffff_ffff };
+    // Inner must be `x - C1` or `x + (-C1)`; const width must match the
+    // compare width (mixed widths can't arise from lifting; refusing them
+    // keeps the rewrite provably equivalent).
+    let stripped = strip_casts(inner);
+    let (x, c1) = match stripped {
+        Expr::Binop { op: aop, lhs, rhs } if aop == "-" => {
+            let k = match (w, &**rhs) {
+                (4, Expr::ConstI32(k)) => *k as u32 as u64,
+                (8, Expr::ConstI64(k)) => *k as u64,
+                _ => return None,
+            };
+            (&**lhs, k)
+        }
+        Expr::Binop { op: aop, lhs, rhs } if aop == "+" => {
+            let k = match (w, &**rhs) {
+                (4, Expr::ConstI32(k)) => (*k as u32).wrapping_neg() as u64,
+                (8, Expr::ConstI64(k)) => (*k as u64).wrapping_neg(),
+                _ => return None,
+            };
+            (&**lhs, k)
+        }
+        _ => return None,
+    };
+    match x {
+        // `x` is used in the rewrite AS-IS (casts included): duplicating
+        // pure casts over a var is sound, while stripping them would change
+        // extension semantics (zero- vs sign-extend on negative values).
+        _ if matches!(
+            strip_casts(x),
+            Expr::Local(_)
+                | Expr::Tmp(_)
+                | Expr::Global(_)
+                | Expr::ConstI32(_)
+                | Expr::ConstI64(_)
+        ) => {}
+        _ => return None,
+    }
+    // C1 + C2 == 1 (mod 2^w) ⟺ condition is `x == 0 || x > C1-1`.
+    if (c1.wrapping_add(c2) & mask) != 1 {
+        return None;
+    }
+    let k = c1.wrapping_sub(1) & mask;
+    let (zero, kk) = if w == 4 {
+        (Expr::ConstI32(0), Expr::ConstI32(k as u32 as i32))
+    } else {
+        (Expr::ConstI64(0), Expr::ConstI64(k as i64))
+    };
+    let gt_op = if w == 4 { ">u32" } else { ">u64" };
+    Some(Expr::Binop {
+        op: "||".into(),
+        lhs: Box::new(Expr::Binop {
+            op: "==".into(),
+            lhs: Box::new(x.clone()),
+            rhs: Box::new(zero),
+        }),
+        rhs: Box::new(Expr::Binop {
+            op: gt_op.into(),
+            lhs: Box::new(x.clone()),
+            rhs: Box::new(kk),
+        }),
+    })
+}
+
 fn fold_expr(e: Expr) -> Expr {
     match e {
         Expr::Binop { op, lhs, rhs } => {
@@ -293,6 +408,16 @@ fn fold_expr(e: Expr) -> Expr {
                     }
                 }
                 _ => {}
+            }
+            // Unsigned-wraparound range idiom: clang merges `x == 0 || x > MAX`
+            // into `(x-K) <u (2^w-K+1)` (single compare). Recognize
+            // `((uintN)(x -/+ C1) < (uintN)(C2))` with C1+C2 == 1 (mod 2^w)
+            // and restore the readable disjunction (sqlite3Malloc's
+            // `n==0 || n>2147483391`). The `>uN` half keeps UNSIGNED
+            // semantics — a signed `>` would diverge for negative x.
+            // `x` must be a bare var (no duplicated side effects).
+            if let Some(rw) = fold_range_idiom(&op, &l, &r) {
+                return rw;
             }
             Expr::Binop { op, lhs: l, rhs: r }
         }

@@ -1414,6 +1414,119 @@ fn const_total(base: &Expr, mem_offset: u64) -> Option<u64> {
 }
 
 /// Absolute const addresses read/written by a body (for data filtering).
+/// Global indices referenced by a body.
+pub fn collect_used_globals(stmts: &[Stmt], acc: &mut HashSet<u32>) {
+    fn expr(e: &Expr, acc: &mut HashSet<u32>) {
+        match e {
+            Expr::Global(i) => {
+                acc.insert(*i);
+            }
+            Expr::Binop { lhs, rhs, .. } => {
+                expr(lhs, acc);
+                expr(rhs, acc);
+            }
+            Expr::Unop { v, .. } => expr(v, acc),
+            Expr::Load { base, .. } => expr(base, acc),
+            Expr::Call { args, .. } => {
+                for a in args {
+                    expr(a, acc);
+                }
+            }
+            Expr::CallIndirect { index, args, .. } => {
+                expr(index, acc);
+                for a in args {
+                    expr(a, acc);
+                }
+            }
+            Expr::Select { c, a, b } => {
+                expr(c, acc);
+                expr(a, acc);
+                expr(b, acc);
+            }
+            Expr::Simd { args, .. } => {
+                for a in args {
+                    expr(a, acc);
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in stmts {
+        match s {
+            Stmt::Assign { expr: e, .. } => expr(e, acc),
+            Stmt::Store { base, value, .. } => {
+                expr(base, acc);
+                expr(value, acc);
+            }
+            Stmt::ExprStmt(e) => expr(e, acc),
+            Stmt::If { cond, then_b, else_b } => {
+                expr(cond, acc);
+                collect_used_globals(then_b, acc);
+                collect_used_globals(else_b, acc);
+            }
+            Stmt::Block { body, .. } | Stmt::Loop { body, .. } => {
+                collect_used_globals(body, acc)
+            }
+            Stmt::BrIf { cond, .. } => expr(cond, acc),
+            Stmt::BrTable { index, .. } => expr(index, acc),
+            Stmt::Return { values } => {
+                for v in values {
+                    expr(v, acc);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Trim a lifted module to what its functions reference, for scoped
+/// (`--func`/`--func-name`) views: data segments shrink to the referenced
+/// address range (+slack for string context), unreferenced segments and
+/// globals are dropped. Absolute addresses are untouched so notes stay
+/// correct. Full-module output must NOT call this.
+pub fn trim_for_scoped_view(m: &mut ModuleIR) {
+    let mut addrs = Vec::new();
+    for f in &m.funcs {
+        collect_data_addrs(&f.body, &mut addrs);
+    }
+    // Trim retained segments to the referenced range (+slack so nearby
+    // string context survives for notes). Only unreferenced tail bytes
+    // (and their strings) disappear from the dump.
+    const SLACK: u64 = 256;
+    for d in m.data.iter_mut() {
+        let Some(off) = d.offset else { continue };
+        let s = off as i64 as u64;
+        let len = d.bytes.len() as u64;
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        let mut any = false;
+        for a in &addrs {
+            if *a >= s && *a < s.wrapping_add(len) {
+                any = true;
+                lo = lo.min(*a);
+                hi = hi.max(*a);
+            }
+        }
+        if !any {
+            d.bytes.clear();
+            continue;
+        }
+        let rel_lo = lo.wrapping_sub(s).saturating_sub(SLACK);
+        let rel_hi = (hi.wrapping_sub(s) + SLACK + 1).min(len);
+        if rel_lo > 0 || rel_hi < len {
+            d.bytes.drain(..rel_lo as usize);
+            d.bytes.truncate((rel_hi - rel_lo) as usize);
+            d.offset = Some(s.wrapping_add(rel_lo) as i32);
+        }
+    }
+    m.data.retain(|d| !d.bytes.is_empty());
+    let mut used = HashSet::new();
+    for f in &m.funcs {
+        collect_used_globals(&f.body, &mut used);
+    }
+    m.globals.retain(|g| used.contains(&g.idx));
+}
+
 pub fn collect_data_addrs(stmts: &[Stmt], acc: &mut Vec<u64>) {
     for s in stmts {
         match s {
