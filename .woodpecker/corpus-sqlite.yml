@@ -28,8 +28,11 @@ steps:
         (cd .sqlite-cache && unzip -o sqlite-amalgamation-3450300.zip)
       - |
         echo "== sqlite3 =="
+        # LINKABLE (relocatable), not STANDALONE: without exports listed,
+        # emcc dead-code-eliminates nearly all of sqlite3.c. Relocatable
+        # output keeps every function (+ names via -g) for analysis.
         emcc .sqlite-cache/sqlite-amalgamation-3450300/sqlite3.c -O1 -g \
-          -s STANDALONE_WASM=1 \
+          -s LINKABLE=1 \
           -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
           -DSQLITE_THREADSAFE=0 \
           -DSQLITE_OMIT_LOAD_EXTENSION=1 \
@@ -37,4 +40,4 @@ steps:
       - ls -la corpus/wasm/sqlite3.wasm
       - emcc --version > corpus/wasm/BUILD-sqlite.txt
       - 'echo "src: sqlite-amalgamation-3450300 (sqlite3.c)" >> corpus/wasm/BUILD-sqlite.txt'
-      - 'echo "flags: -O1 -g -s STANDALONE_WASM=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION=1" >> corpus/wasm/BUILD-sqlite.txt'
+      - 'echo "flags: -O1 -g -s LINKABLE=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION=1" >> corpus/wasm/BUILD-sqlite.txt'

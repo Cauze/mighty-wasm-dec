@@ -46,7 +46,9 @@ woodpecker-cli exec --backend-engine docker .woodpecker/corpus-sqlite.yml
 
 Pinned source: `sqlite-amalgamation-3450300` (downloaded in-pipeline to
 `.sqlite-cache/`, gitignored); provenance in `corpus/wasm/BUILD-sqlite.txt`.
-Same base flags as above plus `-DSQLITE_THREADSAFE=0
+Same base flags as above except `-s LINKABLE=1` instead of
+`-s STANDALONE_WASM=1` (relocatable: without listed exports emcc would
+dead-code-eliminate nearly all of sqlite3.c), plus `-DSQLITE_THREADSAFE=0
 -DSQLITE_OMIT_LOAD_EXTENSION=1`. Analyze scoped
 (`--func-name sqlite3_prepare --max-indent 32 …`), never whole-module
 unless you mean it.
