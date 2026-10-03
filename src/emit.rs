@@ -601,7 +601,13 @@ fn data_note(base: &Expr, mem_offset: u64, is_byte: bool, ctx: &EmitCtx) -> Opti
     None
 }
 
-fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
+fn emit_stmts(
+    stmts: &[Stmt],
+    out: &mut String,
+    lvl: usize,
+    ctx: &EmitCtx,
+    stack: &mut Vec<(String, bool)>,
+) {
     for s in stmts {
         match s {
             Stmt::Assign { dst, expr } => {
@@ -679,15 +685,19 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
             }
             Stmt::If { cond, then_b, else_b } => {
                 out.push_str(&format!("{}if ({}) {{\n", indent(lvl, ctx.max_indent), emit_expr(cond, ctx)));
-                emit_stmts(then_b, out, lvl + 1, ctx);
+                emit_stmts(then_b, out, lvl + 1, ctx, stack);
                 if !else_b.is_empty() {
                     out.push_str(&format!("{}}} else {{\n", indent(lvl, ctx.max_indent)));
-                    emit_stmts(else_b, out, lvl + 1, ctx);
+                    emit_stmts(else_b, out, lvl + 1, ctx, stack);
                 }
                 out.push_str(&format!("{}}}\n", indent(lvl, ctx.max_indent)));
             }
             Stmt::Block { label, body } => {
-                // unreferenced labels with straight-line bodies collapse to braces
+                // Any incoming branch forces `do{}while(0)` form: even a
+                // single-level `break` needs a loop to bind to (a `break`
+                // inside plain braces would be invalid C). Only the jump
+                // *form* goes single-level (see Br/BrIf arms); an unused
+                // `__end_` label may remain, which is valid but dead.
                 let referenced = ctx.ref_labels.contains(label);
                 let ends_in_goto = matches!(
                     body.last(),
@@ -695,11 +705,15 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                 );
                 if !referenced && !ends_in_goto {
                     out.push_str(&format!("{}/* block */ {{\n", indent(lvl, ctx.max_indent)));
-                    emit_stmts(body, out, lvl + 1, ctx);
+                    stack.push((label.clone(), false));
+                    emit_stmts(body, out, lvl + 1, ctx, stack);
+                    stack.pop();
                     out.push_str(&format!("{}}}\n", indent(lvl, ctx.max_indent)));
                 } else {
                     out.push_str(&format!("{}do {{ /* block {label} */\n", indent(lvl, ctx.max_indent)));
-                    emit_stmts(body, out, lvl + 1, ctx);
+                    stack.push((label.clone(), false));
+                    emit_stmts(body, out, lvl + 1, ctx, stack);
+                    stack.pop();
                     out.push_str(&format!(
                         "{}}} while (0);\n{}__end_{label}: ;\n",
                         indent(lvl, ctx.max_indent),
@@ -709,7 +723,9 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
             }
             Stmt::Loop { label, body } => {
                 out.push_str(&format!("{}__head_{label}: while (1) {{ /* loop {label} */\n", indent(lvl, ctx.max_indent)));
-                emit_stmts(body, out, lvl + 1, ctx);
+                stack.push((label.clone(), true));
+                emit_stmts(body, out, lvl + 1, ctx, stack);
+                stack.pop();
                 // Wasm `loop` falls through to exit; C `while (1)` does not.
                 // Clang's canonical counted loop ends in `br_if`-continue +
                 // fallthrough exit, so without this the output hangs. Append
@@ -725,14 +741,36 @@ fn emit_stmts(stmts: &[Stmt], out: &mut String, lvl: usize, ctx: &EmitCtx) {
                 out.push_str(&format!("{}}}\n{}__end_{label}: ;\n", indent(lvl, ctx.max_indent), indent(lvl, ctx.max_indent)));
             }
             Stmt::Br { label, is_loop, .. } => {
-                if *is_loop {
+                // Single-level transfers render as break/continue; deeper
+                // ones keep goto (same rule as collect_goto_labels).
+                let single =
+                    stack.last().map_or(false, |(l, il)| l == label && il == is_loop);
+                if single && *is_loop {
+                    out.push_str(&format!("{}continue; /* loop {label} */\n", indent(lvl, ctx.max_indent)));
+                } else if single {
+                    out.push_str(&format!("{}break; /* block {label} */\n", indent(lvl, ctx.max_indent)));
+                } else if *is_loop {
                     out.push_str(&format!("{}goto __head_{label}; /* continue */\n", indent(lvl, ctx.max_indent)));
                 } else {
                     out.push_str(&format!("{}goto __end_{label}; /* break */\n", indent(lvl, ctx.max_indent)));
                 }
             }
             Stmt::BrIf { label, is_loop, cond, .. } => {
-                if *is_loop {
+                let single =
+                    stack.last().map_or(false, |(l, il)| l == label && il == is_loop);
+                if single && *is_loop {
+                    out.push_str(&format!(
+                        "{}if ({}) continue;\n",
+                        indent(lvl, ctx.max_indent),
+                        emit_expr(cond, ctx)
+                    ));
+                } else if single {
+                    out.push_str(&format!(
+                        "{}if ({}) break;\n",
+                        indent(lvl, ctx.max_indent),
+                        emit_expr(cond, ctx)
+                    ));
+                } else if *is_loop {
                     out.push_str(&format!(
                         "{}if ({}) goto __head_{label};\n",
                         indent(lvl, ctx.max_indent),
@@ -1194,7 +1232,7 @@ pub fn emit_c_with(m: &ModuleIR, cfg: &EmitConfig) -> String {
             max_indent: cfg.max_indent,
             ref_labels: &ref_labels,
         };
-        emit_stmts(&f.body, &mut out, 1, &ctx);
+        emit_stmts(&f.body, &mut out, 1, &ctx, &mut Vec::new());
         let ends_with_return = f.body.last().is_some_and(|s| matches!(s, Stmt::Return { .. }));
         if !ends_with_return {
             if f.results.is_empty() {

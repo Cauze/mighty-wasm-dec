@@ -3,7 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{Expr, FuncIR, Stmt, Var};
+use crate::cfg;
+use crate::ir::{Expr, FuncIR, ModuleIR, Stmt, Var};
 
 /// Per-pass switches (CLI `--no-*`). All default on; `--no-opt` disables all.
 #[derive(Debug, Clone)]
@@ -92,7 +93,12 @@ impl FuncPass for InlineDcePass {
             dce: self.dce,
             simplify: false,
         };
-        inline_and_dce(&mut f.body, &opt, &mut ctx.aliases)
+        // Depth-gate the CFG order guard once per call (not per round):
+        // iterative dataflow cost scales with nesting depth. Deep dispatch
+        // scaffolding (f2422: ~990) keeps the old positional guard and its
+        // old speed; everything else gets dominance.
+        let cfg_guard = nesting_depth(&f.body) <= CFG_DEPTH_LIMIT;
+        inline_and_dce(&mut f.body, &opt, &mut ctx.aliases, cfg_guard)
     }
 }
 
@@ -112,6 +118,114 @@ impl FuncPass for SplitInitPass {
     fn run(&self, f: &mut FuncIR, _ctx: &mut PassCtx) -> bool {
         split_init_stores(f)
     }
+}
+
+/// A whole-module pass (Phase C). Runs after per-function optimization;
+/// sees the call graph, summaries, and all bodies.
+pub trait ModulePass {
+    fn name(&self) -> &'static str;
+    fn run(&self, m: &mut ModuleIR) -> bool;
+}
+
+/// Fold direct calls to `return <const>` callees into the constant.
+/// Sound: the callee body is a lone `return const` (no effects), and
+/// only pure-arg call sites rewrite (dropping effectful args would
+/// change semantics).
+pub struct ConstRetPass;
+
+impl ModulePass for ConstRetPass {
+    fn name(&self) -> &'static str {
+        "const-ret"
+    }
+    fn run(&self, m: &mut ModuleIR) -> bool {
+        let sums = crate::callgraph::summarize(m);
+        let mut changed = false;
+        for f in m.funcs.iter_mut() {
+            changed |= fold_const_calls(&mut f.body, &sums);
+        }
+        changed
+    }
+}
+
+fn fold_const_calls(
+    stmts: &mut Vec<Stmt>,
+    sums: &HashMap<u32, crate::callgraph::Summary>,
+) -> bool {
+    fn expr(e: &mut Expr, sums: &HashMap<u32, crate::callgraph::Summary>) -> bool {
+        let mut changed = false;
+        match e {
+            Expr::Call { func, args, .. } => {
+                for a in args.iter_mut() {
+                    changed |= expr(a, sums);
+                }
+                if let Some(c) = sums.get(func).and_then(|s| s.ret_const.clone()) {
+                    if args.iter().all(|a| a.is_pure()) {
+                        *e = c;
+                        changed = true;
+                    }
+                }
+            }
+            Expr::CallIndirect { index, args, .. } => {
+                changed |= expr(index, sums);
+                for a in args.iter_mut() {
+                    changed |= expr(a, sums);
+                }
+            }
+            Expr::Binop { lhs, rhs, .. } => {
+                changed |= expr(lhs, sums);
+                changed |= expr(rhs, sums);
+            }
+            Expr::Unop { v, .. } => changed |= expr(v, sums),
+            Expr::Load { base, .. } => changed |= expr(base, sums),
+            Expr::Select { c, a, b } => {
+                changed |= expr(c, sums);
+                changed |= expr(a, sums);
+                changed |= expr(b, sums);
+            }
+            Expr::Simd { args, .. } => {
+                for a in args.iter_mut() {
+                    changed |= expr(a, sums);
+                }
+            }
+            _ => {}
+        }
+        changed
+    }
+    let mut changed = false;
+    for s in stmts.iter_mut() {
+        match s {
+            Stmt::Assign { expr: e, .. } => changed |= expr(e, sums),
+            Stmt::Store { base, value, .. } => {
+                changed |= expr(base, sums);
+                changed |= expr(value, sums);
+            }
+            Stmt::ExprStmt(e) => {
+                changed |= expr(e, sums);
+                // A call reduced to a bare const statement is dead.
+                if matches!(e, Expr::ConstI32(_) | Expr::ConstI64(_)) {
+                    *s = Stmt::Comment("const-ret: pure call folded away".into());
+                    changed = true;
+                }
+            }
+            Stmt::If { cond, then_b, else_b } => {
+                changed |= expr(cond, sums);
+                changed |= fold_const_calls(then_b, sums);
+                changed |= fold_const_calls(else_b, sums);
+            }
+            Stmt::Block { body, .. } | Stmt::Loop { body, .. } => {
+                changed |= fold_const_calls(body, sums)
+            }
+            Stmt::BrIf { cond, .. } => changed |= expr(cond, sums),
+            Stmt::BrTable { index, .. } => changed |= expr(index, sums),
+            Stmt::Return { values } => {
+                for v in values.iter_mut() {
+                    changed |= expr(v, sums);
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
 }
 
 pub fn optimize_func_with(f: &mut FuncIR, opt: &OptConfig) -> AliasMap {
@@ -865,7 +979,108 @@ pub fn sweep_assigns(stmts: &mut Vec<Stmt>, dead: &HashSet<Var>) -> bool {
     changed || stmts.len() != before
 }
 
-fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap) -> bool {
+/// Positional order check for straight-line bodies (exact there):
+/// single def (D) precedes single use (U), no rep-var def strictly between.
+fn order_ok_seq(
+    def_seqs: &HashMap<Var, Vec<usize>>,
+    use_seqs: &HashMap<Var, Vec<usize>>,
+    dst: &Var,
+    reps: &[Var],
+) -> bool {
+    match (
+        def_seqs.get(dst).and_then(|v| v.first()),
+        use_seqs.get(dst).and_then(|v| v.first()),
+    ) {
+        (Some(&d), Some(&u)) if d <= u => !reps.iter().any(|v| {
+            def_seqs.get(v).map_or(false, |ss| {
+                ss.iter().any(|&s| s > d && s < u)
+            })
+        }),
+        _ => false,
+    }
+}
+
+/// Dominance order check for bodies with control flow: the single def
+/// block dominates the single use block, and no rep-var def sits on any
+/// def→use path (endpoints excluded, as in the seq check).
+fn cfg_order_ok(g: &cfg::Cfg, dom: &[HashSet<cfg::BlockId>], dst: Var, expr: &Expr) -> bool {
+    let (Some(d), Some(u)) = (
+        g.def_blocks.get(&dst).and_then(|v| match v[..] {
+            [only] => Some(only),
+            _ => None,
+        }),
+        g.use_blocks.get(&dst).and_then(|v| match v[..] {
+            [only] => Some(only),
+            _ => None,
+        }),
+    ) else {
+        return false;
+    };
+    if !cfg::dominates(dom, d, u) {
+        return false;
+    }
+    let mut reps = Vec::new();
+    expr.vars(&mut reps);
+    let between = cfg::blocks_between(g, d, u);
+    !reps.iter().any(|v| {
+        g.def_blocks.get(v).map_or(false, |bs| {
+            bs.iter().any(|&b| b != d && b != u && between.contains(&b))
+        })
+    })
+}
+
+/// Max Block/Loop/If nesting for the CFG order guard. Deep dispatch
+/// scaffolding (f2422: ~990) falls back to the positional check:
+/// iterative dataflow cost scales with depth. 256 keeps real functions
+/// (sqlite3VdbeExec nests well under 100) on the precise path.
+const CFG_DEPTH_LIMIT: usize = 256;
+
+/// Max Block/Loop/If nesting depth (early-out past the limit).
+fn nesting_depth(stmts: &[Stmt]) -> usize {
+    fn walk(stmts: &[Stmt], depth: usize, best: &mut usize) {
+        if depth > *best {
+            *best = depth;
+            if *best > CFG_DEPTH_LIMIT {
+                return;
+            }
+        }
+        for s in stmts {
+            match s {
+                Stmt::If { then_b, else_b, .. } => {
+                    walk(then_b, depth + 1, best);
+                    walk(else_b, depth + 1, best);
+                }
+                Stmt::Block { body, .. } | Stmt::Loop { body, .. } => {
+                    walk(body, depth + 1, best);
+                }
+                _ => {}
+            }
+            if *best > CFG_DEPTH_LIMIT {
+                return;
+            }
+        }
+    }
+    let mut best = 0;
+    walk(stmts, 0, &mut best);
+    best
+}
+
+/// True if the body contains any control-flow statement (ordering then
+/// needs dominance, not positions).
+fn has_control_flow(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::If { .. } | Stmt::Block { .. } | Stmt::Loop { .. } => true,
+        Stmt::Br { .. } | Stmt::BrIf { .. } | Stmt::BrTable { .. } => true,
+        _ => false,
+    })
+}
+
+fn inline_and_dce(
+    stmts: &mut Vec<Stmt>,
+    opt: &OptConfig,
+    aliases: &mut AliasMap,
+    cfg_guard: bool,
+) -> bool {
     let mut changed = false;
     // Batched inlining (perf): one map computation per round, one
     // substitution walk + one removal sweep for the whole batch — the old
@@ -894,6 +1109,8 @@ fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap
                 assigns.keys().map(|v| (v, v.name())).collect();
             names.sort_by(|a, b| a.1.cmp(&b.1));
             let mut batch: Vec<(Var, Expr)> = Vec::new();
+            // Stage 1: cheap guards (single def/use, loop, inlineable).
+            let mut maybe: Vec<(Var, Expr)> = Vec::new();
             for (dst, _) in names {
                 // Only locals/tmps inline: globals (gN) are cross-function
                 // visible, so their assignments always stand (as before).
@@ -909,30 +1126,6 @@ fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap
                 if !dst.is_tmp() && *in_loop {
                     continue;
                 }
-                // Order guard (accuracy): the single def (D) must precede
-                // the single use (U), and no redefinition of any variable
-                // mentioned in the replacement may sit strictly between
-                // them — else the inlined value is stale (intops: l3=l2
-                // with l2 clobbered turned q+r into r+r; same for param
-                // sources clobbered after the copy).
-                let order_ok = match (
-                    def_seqs.get(dst).and_then(|v| v.first()),
-                    use_seqs.get(dst).and_then(|v| v.first()),
-                ) {
-                    (Some(&d), Some(&u)) if d <= u => {
-                        let mut reps = Vec::new();
-                        expr.vars(&mut reps);
-                        !reps.iter().any(|v| {
-                            def_seqs.get(v).map_or(false, |ss| {
-                                ss.iter().any(|&s| s > d && s < u)
-                            })
-                        })
-                    }
-                    _ => false,
-                };
-                if !order_ok {
-                    continue;
-                }
                 let inlineable = expr.is_pure()
                     || matches!(
                         expr,
@@ -941,7 +1134,34 @@ fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap
                     || matches!(expr, Expr::Simd { op, args }
                         if args.iter().all(|a| a.is_pure()) && !simd_has_effect(op));
                 if inlineable {
-                    batch.push((*dst, expr.clone()));
+                    maybe.push((*dst, expr.clone()));
+                }
+            }
+            if maybe.is_empty() {
+                break;
+            }
+            // Stage 2: order guard. Straight-line bodies use the positional
+            // check (exact there, and free); control flow gets real
+            // dominance from a per-round CFG (seq numbers lie across
+            // branches). Deep-nesting monsters (f2422: ~990 levels) fall
+            // back to seq: iterative dataflow cost scales with depth,
+            // and dispatch scaffolding that deep gains nothing from it.
+            // See docs/CFG_FULL_PLAN.md Phase B.
+            if has_control_flow(stmts) && cfg_guard {
+                let g = cfg::build(stmts);
+                let dom = cfg::dominators(&g);
+                for (dst, expr) in maybe {
+                    if cfg_order_ok(&g, &dom, dst, &expr) {
+                        batch.push((dst, expr));
+                    }
+                }
+            } else {
+                for (dst, expr) in maybe {
+                    let mut reps = Vec::new();
+                    expr.vars(&mut reps);
+                    if order_ok_seq(&def_seqs, &use_seqs, &dst, &reps) {
+                        batch.push((dst, expr));
+                    }
                 }
             }
             if batch.is_empty() {

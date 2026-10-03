@@ -163,6 +163,12 @@ fn run(args: Args) -> Result<()> {
     for f in mir.funcs.iter_mut() {
         passes::optimize_func_with(f, &opt);
     }
+    // Inter-proc const folding (Phase C): fold direct calls to lone
+    // `return const` bodies. Gated with folding like its intra-proc kin.
+    if opt.fold {
+        use mighty_wasm_dec::passes::ModulePass;
+        passes::ConstRetPass.run(&mut mir);
+    }
 
     let strings_mode = if args.no_strings {
         emit::StringsMode::Off
@@ -290,6 +296,14 @@ fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mighty_wasm_dec::cfg;
+
+    fn lift_wat(wat: &str) -> mighty_wasm_dec::ir::FuncIR {
+        let bytes = wat::parse_str(wat).unwrap();
+        let mut meta = parse::parse_meta(&bytes).unwrap();
+        let mir = lift::lift_module(&bytes, &mut meta).unwrap();
+        mir.funcs.into_iter().last().unwrap()
+    }
 
     fn decompile_wat(wat: &str) -> String {
         let bytes = wat::parse_str(wat).unwrap();
@@ -532,7 +546,8 @@ mod tests {
 
     #[test]
     fn loop_continue_preserved() {
-        // Loop ending in unconditional continue must keep looping.
+        // Loop ending in unconditional continue must keep looping — now
+        // as `continue` (single-level), not `goto`.
         // (An earlier revision dropped the back-edge and the emitter's
         // fallthrough `break` turned it into loop-exit: wrong-code on
         // sqlite3_step/VdbeExec. The `br_if` above is the real exit edge.)
@@ -544,7 +559,29 @@ mod tests {
               (local.set 1 (i32.add (local.get 1) (i32.const 1)))
               (br 0)))
             (local.get 1)))"#);
-        assert!(c.contains("goto __head_"), "expected loop-back goto, got:\n{c}");
+        assert!(c.contains("continue;"), "expected loop-back continue, got:\n{c}");
+    }
+
+    #[test]
+    fn single_level_break_not_goto() {
+        // `br` to the immediately enclosing block renders `break`.
+        let c = decompile_opt_wat(r#"(module
+          (func (param i32) (result i32)
+            (block $b (br_if $b (i32.eqz (local.get 0))) (i32.const 7))))"#);
+        assert!(c.contains("break;"), "expected break, got:\n{c}");
+        assert!(!c.contains("goto __end_"), "expected no goto, got:\n{c}");
+    }
+
+    #[test]
+    fn multi_level_branch_stays_goto() {
+        // `br` two levels out cannot be `break` (C has no labeled break).
+        let c = decompile_opt_wat(r#"(module
+          (func (param i32) (result i32)
+            (block $outer
+              (block $inner
+                (br $outer))
+              (i32.const 1))))"#);
+        assert!(c.contains("goto __end_"), "expected goto, got:\n{c}");
     }
 
     #[test]
@@ -724,8 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn var_parse_and_name() {
-        use mighty_wasm_dec::ir::{Expr, Var};
+    fn var_parse_and_name() {        use mighty_wasm_dec::ir::{Expr, Var};
         assert_eq!(Var::parse("l3"), Some(Var::Local(3)));
         assert_eq!(Var::parse("t0"), Some(Var::Tmp(0)));
         assert_eq!(Var::parse("g12"), Some(Var::Global(12)));
@@ -755,6 +791,96 @@ mod tests {
             v: Box::new(Expr::Local(2)),
         };
         assert!(matches!(casted.strip_casts(), Expr::Local(2)));
+    }
+
+    #[test]
+    fn cfg_covers_branches_and_loops() {
+        // if/else with returns in both arms + loop + br_table: every edge
+        // must resolve (no placeholder targets left behind).
+        let f = lift_wat(r#"(module
+          (func (param i32) (result i32) (local i32)
+            (if (i32.eqz (local.get 0)) (then (return (i32.const 1))) (else (nop)))
+            (block $b (loop $l
+              (br_if $b (i32.ge_s (local.get 1) (local.get 0)))
+              (local.set 1 (i32.add (local.get 1) (i32.const 1)))
+              (br $l)))
+            (block (br_table 0 0 (local.get 1)))
+            (i32.const 7)))"#);
+        let g = cfg::build(&f.body);
+        // No unresolved branch-taken edges.
+        for b in &g.blocks {
+            if let cfg::Terminator::Branch { then_b, .. } = b.term {
+                assert_ne!(then_b, usize::MAX, "unresolved BrIf in block {}", b.id);
+            }
+        }
+        // def/use maps see the counter local.
+        use mighty_wasm_dec::ir::Var;
+        assert!(!g.def_blocks.get(&Var::Local(1)).unwrap_or(&vec![]).is_empty());
+        assert!(!g.use_blocks.get(&Var::Local(0)).unwrap_or(&vec![]).is_empty());
+        // Entry reaches the return-bearing blocks (no lost code). The
+        // function-exit block may itself be unreachable (code after an
+        // unconditional `br_table` is dead) — only reachable returns
+        // must be dominated by entry.
+        let dom = cfg::dominators(&g);
+        let reach = cfg::reachable(&g);
+        let ret_blocks: Vec<_> = g
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.term, cfg::Terminator::Return(_)) && reach.contains(&b.id))
+            .map(|b| b.id)
+            .collect();
+        assert!(!ret_blocks.is_empty());
+        for r in ret_blocks {
+            assert!(cfg::dominates(&dom, g.entry, r), "entry must dominate {r}");
+        }
+    }
+
+    #[test]
+    fn cfg_diamond_dominance() {
+        // if/else join: entry dominates the join, arms don't dominate it.
+        let f = lift_wat(r#"(module
+          (func (param i32) (result i32)
+            (if (result i32) (local.get 0)
+              (then (i32.const 1)) (else (i32.const 2)))))"#);
+        let g = cfg::build(&f.body);
+        let dom = cfg::dominators(&g);
+        // Join = the block with 2 preds that isn't entry.
+        let join = g.blocks.iter().find(|b| b.preds.len() == 2).map(|b| b.id);
+        let Some(j) = join else { panic!("expected diamond join") };
+        assert!(cfg::dominates(&dom, g.entry, j));
+        for b in &g.blocks {
+            if b.id != g.entry && b.id != j && !b.stmts.is_empty() {
+                assert!(!cfg::dominates(&dom, b.id, j), "arm {} must not dominate join", b.id);
+            }
+        }
+        // blocks_between(entry, join) covers the diamond arms.
+        let between = cfg::blocks_between(&g, g.entry, j);
+        assert!(between.contains(&g.entry) && between.contains(&j));
+        assert!(between.len() >= 4, "diamond has entry+2 arms+join, got {}", between.len());
+    }
+
+    #[test]
+    fn const_ret_folds_across_functions() {
+        use mighty_wasm_dec::callgraph;
+        use mighty_wasm_dec::passes::ModulePass;
+        let bytes = wat::parse_str(r#"(module
+          (func $k (result i32) (i32.const 41))
+          (func (result i32) (i32.add (call $k) (i32.const 1))))"#)
+        .unwrap();
+        let mut meta = parse::parse_meta(&bytes).unwrap();
+        let mut mir = lift::lift_module(&bytes, &mut meta).unwrap();
+        for f in mir.funcs.iter_mut() {
+            passes::optimize_func(f);
+        }
+        // call graph sees the edge; callee summarizes to a const
+        let g = callgraph::graph(&mir);
+        assert!(g.values().any(|cs| cs.contains(&0)));
+        let sums = callgraph::summarize(&mir);
+        assert!(sums.values().any(|s| s.ret_const.is_some()));
+        assert!(callgraph::sccs(&mir).iter().all(|scc| !scc.is_empty()));
+        passes::ConstRetPass.run(&mut mir);
+        let c = emit::emit_c(&mir);
+        assert!(c.contains("return (41 + 1)") || c.contains("return 42"), "expected folded const, got:\n{c}");
     }
 
     #[test]

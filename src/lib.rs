@@ -4,6 +4,8 @@
 //! authors start here: see the `passes::FuncPass` trait and
 //! `examples/const_on_right.rs`.
 
+pub mod callgraph;
+pub mod cfg;
 pub mod emit;
 pub mod ir;
 pub mod lift;
