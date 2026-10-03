@@ -6,7 +6,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "mighty-wasm-dec", about = "full-Rust wasm->C decompiler (MVP)")]
+#[command(name = "mighty-wasm-dec", version, about = "full-Rust wasm->C decompiler (MVP)")]
 struct Args {
     input: PathBuf,
     /// only emit this func index (filters output, not just a comment)
