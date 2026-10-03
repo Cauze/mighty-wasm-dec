@@ -4,3 +4,4 @@
 /out/
 /corpus/decompiled/
 /corpus/wasm/*.wasm
+/.sqlite-cache/

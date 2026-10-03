@@ -1,0 +1,40 @@
+# Woodpecker pipeline (OPT-IN): build SQLite to standalone wasm with Emscripten.
+#
+# Separate from .woodpecker/corpus.yml on purpose: the sqlite amalgamation
+# is ~9MB of source and produces a multi-MB wasm + very large decompiler
+# output. It is a scale/accuracy target, not part of the fast default set.
+#
+# Run from the project root (mighty-wasm-dec):
+#   woodpecker-cli exec --backend-engine docker .woodpecker/corpus-sqlite.yml
+#
+# NOTE: --backend-engine docker is required. The default is the local
+# backend, which would try to run emcc on Windows instead of in the
+# emscripten image.
+when:
+  event: manual
+
+steps:
+  build-sqlite:
+    image: emscripten/emsdk:4.0.10
+    commands:
+      - emcc --version
+      - mkdir -p corpus/wasm .sqlite-cache
+      # Pin the amalgamation so rebuilds are reproducible.
+      - |
+        if [ ! -f .sqlite-cache/sqlite-amalgamation-3450300.zip ]; then
+          curl -L -o .sqlite-cache/sqlite-amalgamation-3450300.zip \
+            https://www.sqlite.org/2024/sqlite-amalgamation-3450300.zip
+        fi
+        (cd .sqlite-cache && unzip -o sqlite-amalgamation-3450300.zip)
+      - |
+        echo "== sqlite3 =="
+        emcc .sqlite-cache/sqlite-amalgamation-3450300/sqlite3.c -O1 -g \
+          -s STANDALONE_WASM=1 \
+          -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
+          -DSQLITE_THREADSAFE=0 \
+          -DSQLITE_OMIT_LOAD_EXTENSION=1 \
+          -o corpus/wasm/sqlite3.wasm
+      - ls -la corpus/wasm/sqlite3.wasm
+      - emcc --version > corpus/wasm/BUILD-sqlite.txt
+      - 'echo "src: sqlite-amalgamation-3450300 (sqlite3.c)" >> corpus/wasm/BUILD-sqlite.txt'
+      - 'echo "flags: -O1 -g -s STANDALONE_WASM=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION=1" >> corpus/wasm/BUILD-sqlite.txt'

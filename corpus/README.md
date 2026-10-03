@@ -34,6 +34,23 @@ Flags: `-O1 -g -s STANDALONE_WASM=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0`.
 `-g` keeps the name section so `fac`/`move_x`/`apply` survive;
 `-O1` + `noinline` keeps test functions separate without startup bloat.
 
+## Opt-in large target: SQLite
+
+`corpus/wasm/sqlite3.wasm` is built by a **separate** manual pipeline
+(`.woodpecker/corpus-sqlite.yml`), not the default one — the amalgamation
+is ~9MB of source and the output is a scale/accuracy target:
+
+```
+woodpecker-cli exec --backend-engine docker .woodpecker/corpus-sqlite.yml
+```
+
+Pinned source: `sqlite-amalgamation-3450300` (downloaded in-pipeline to
+`.sqlite-cache/`, gitignored); provenance in `corpus/wasm/BUILD-sqlite.txt`.
+Same base flags as above plus `-DSQLITE_THREADSAFE=0
+-DSQLITE_OMIT_LOAD_EXTENSION=1`. Analyze scoped
+(`--func-name sqlite3_prepare --max-indent 32 …`), never whole-module
+unless you mean it.
+
 ## Refreshing expected outputs
 
 ```
