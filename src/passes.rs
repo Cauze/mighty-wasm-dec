@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{Expr, FuncIR, Stmt};
+use crate::ir::{Expr, FuncIR, Stmt, Var};
 
 /// Per-pass switches (CLI `--no-*`). All default on; `--no-opt` disables all.
 #[derive(Debug, Clone)]
@@ -165,35 +165,16 @@ fn simd_has_effect(op: &str) -> bool {
         || op.starts_with("array.init")
 }
 
-/// True if evaluating `e` has no observable effect (safe to duplicate/eliminate)
- pub fn is_pure(e: &Expr) -> bool {    match e {
-        Expr::ConstI32(_)
-        | Expr::ConstI64(_)
-        | Expr::ConstF32(_)
-        | Expr::ConstF64(_)
-        | Expr::Local(_)
-        | Expr::Tmp(_)
-        | Expr::Global(_) => true,
-        Expr::Binop { lhs, rhs, .. } => is_pure(lhs) && is_pure(rhs),
-        Expr::Unop { v, .. } => is_pure(v),
-        Expr::Select { c, a, b } => is_pure(c) && is_pure(a) && is_pure(b),
-        _ => false,
-    }
+/// True if evaluating `e` has no observable effect (safe to duplicate/eliminate).
+/// Thin wrapper over [`Expr::is_pure`] kept for compatibility.
+pub fn is_pure(e: &Expr) -> bool {
+    e.is_pure()
 }
 
-/// Expression-tree depth (inlining budget heuristic)
- pub fn expr_depth(e: &Expr) -> usize {
-    match e {
-        Expr::Binop { lhs, rhs, .. } => 1 + expr_depth(lhs).max(expr_depth(rhs)),
-        Expr::Unop { v, .. } => 1 + expr_depth(v),
-        Expr::Select { c, a, b } => 1 + expr_depth(c).max(expr_depth(a).max(expr_depth(b))),
-        Expr::Load { base, .. } => 1 + expr_depth(base),
-        Expr::Call { args, .. } => 1 + args.iter().map(expr_depth).max().unwrap_or(0),
-        Expr::CallIndirect { index, args, .. } => {
-            1 + expr_depth(index).max(args.iter().map(expr_depth).max().unwrap_or(0))
-        }
-        _ => 0,
-    }
+/// Expression-tree depth (inlining budget heuristic).
+/// Thin wrapper over [`Expr::depth`] kept for compatibility.
+pub fn expr_depth(e: &Expr) -> usize {
+    e.depth()
 }
 
 // ---------- const fold ----------
@@ -266,24 +247,6 @@ fn fold_i64(op: &str, a: i64, b: i64) -> Option<i64> {
     }
 }
 
-/// Strip conversion-cast wrappers (`(uint32_t)`, `(int64_t)`, …) to the
-/// core expression. Used by idiom matching; casts are pure so stripping
-/// for *recognition* is sound (the rewrite re-casts as needed).
-fn strip_casts(e: &Expr) -> &Expr {
-    let mut cur = e;
-    loop {
-        match cur {
-            Expr::Unop { op, v }
-                if (op.starts_with("(u") || op.starts_with("(i"))
-                    && op.ends_with(')') =>
-            {
-                cur = v;
-            }
-            _ => return cur,
-        }
-    }
-}
-
 fn fold_range_idiom(op: &str, l: &Expr, r: &Expr) -> Option<Expr> {
     // Two spellings of the same compare: explicit `(uintN)` casts around a
     // plain `<` (hand-written/lenient producers), or our own `<uN` op which
@@ -321,7 +284,7 @@ fn fold_range_idiom(op: &str, l: &Expr, r: &Expr) -> Option<Expr> {
     // Inner must be `x - C1` or `x + (-C1)`; const width must match the
     // compare width (mixed widths can't arise from lifting; refusing them
     // keeps the rewrite provably equivalent).
-    let stripped = strip_casts(inner);
+    let stripped = inner.strip_casts();
     let (x, c1) = match stripped {
         Expr::Binop { op: aop, lhs, rhs } if aop == "-" => {
             let k = match (w, &**rhs) {
@@ -346,7 +309,7 @@ fn fold_range_idiom(op: &str, l: &Expr, r: &Expr) -> Option<Expr> {
         // pure casts over a var is sound, while stripping them would change
         // extension semantics (zero- vs sign-extend on negative values).
         _ if matches!(
-            strip_casts(x),
+            x.strip_casts(),
             Expr::Local(_)
                 | Expr::Tmp(_)
                 | Expr::Global(_)
@@ -565,10 +528,11 @@ fn fold_block(stmts: Vec<Stmt>) -> (Vec<Stmt>, bool, bool) {
 
 // ---------- use counts / inline / DCE ----------
 
-fn count_uses_expr(e: &Expr, map: &mut HashMap<String, usize>) {
+fn count_uses_expr(e: &Expr, map: &mut HashMap<Var, usize>) {
     match e {
-        Expr::Local(i) => *map.entry(format!("l{i}")).or_default() += 1,
-        Expr::Tmp(i) => *map.entry(format!("t{i}")).or_default() += 1,
+        Expr::Local(i) => *map.entry(Var::Local(*i)).or_default() += 1,
+        Expr::Tmp(i) => *map.entry(Var::Tmp(*i)).or_default() += 1,
+        Expr::Global(i) => *map.entry(Var::Global(*i)).or_default() += 1,
         Expr::Binop { lhs, rhs, .. } => {
             count_uses_expr(lhs, map);
             count_uses_expr(rhs, map);
@@ -600,8 +564,8 @@ fn count_uses_expr(e: &Expr, map: &mut HashMap<String, usize>) {
     }
 }
 
-/// Count `lN`/`tN` mentions per statement list (pass-author toolkit)
- pub fn count_uses_stmts(stmts: &[Stmt], map: &mut HashMap<String, usize>) {
+/// Count `Var` mentions per statement list (pass-author toolkit).
+pub fn count_uses_stmts(stmts: &[Stmt], map: &mut HashMap<Var, usize>) {
     for s in stmts {
         match s {
             Stmt::Assign { expr, .. } => count_uses_expr(expr, map),
@@ -633,12 +597,13 @@ fn count_uses_expr(e: &Expr, map: &mut HashMap<String, usize>) {
 fn collect_assigns_loop(
     stmts: &[Stmt],
     in_loop: bool,
-    map: &mut HashMap<String, (Expr, usize, bool)>,
+    map: &mut HashMap<Var, (Expr, usize, bool)>,
 ) {
     for s in stmts {
         match s {
             Stmt::Assign { dst, expr } => {
-                map.entry(dst.clone())
+                let Some(v) = Var::parse(dst) else { continue };
+                map.entry(v)
                     .and_modify(|(_, n, il)| {
                         *n += 1;
                         *il = *il || in_loop;
@@ -656,7 +621,7 @@ fn collect_assigns_loop(
     }
 }
 
-fn dce_list(stmts: &mut Vec<Stmt>, uses: &HashMap<String, usize>) -> bool {
+fn dce_list(stmts: &mut Vec<Stmt>, uses: &HashMap<Var, usize>) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i < stmts.len() {
@@ -675,8 +640,9 @@ fn dce_list(stmts: &mut Vec<Stmt>, uses: &HashMap<String, usize>) -> bool {
             // Only locals/tmps participate: globals (gN) are visible
             // cross-function (e.g. the g0 stack pointer), so their
             // assignments are always kept.
-            let is_local = dst.starts_with('l') || dst.starts_with('t');
-            let used = uses.get(dst).copied().unwrap_or(0);
+            let v = Var::parse(dst);
+            let is_local = matches!(v, Some(Var::Local(_)) | Some(Var::Tmp(_)));
+            let used = v.and_then(|v| uses.get(&v)).copied().unwrap_or(0);
             if is_local && used == 0 {
                 let expr = expr.clone();
                 let dst_c = dst.clone();
@@ -696,49 +662,19 @@ fn dce_list(stmts: &mut Vec<Stmt>, uses: &HashMap<String, usize>) -> bool {
     changed
 }
 
-/// Variable names mentioned in `e` (pass-author toolkit)
- pub fn rep_var_names(e: &Expr, acc: &mut Vec<String>) {
-    match e {
-        Expr::Local(i) => acc.push(format!("l{i}")),
-        Expr::Tmp(i) => acc.push(format!("t{i}")),
-        Expr::Binop { lhs, rhs, .. } => {
-            rep_var_names(lhs, acc);
-            rep_var_names(rhs, acc);
-        }
-        Expr::Unop { v, .. } => rep_var_names(v, acc),
-        Expr::Load { base, .. } => rep_var_names(base, acc),
-        Expr::Call { args, .. } => {
-            for a in args {
-                rep_var_names(a, acc);
-            }
-        }
-        Expr::CallIndirect { index, args, .. } => {
-            rep_var_names(index, acc);
-            for a in args {
-                rep_var_names(a, acc);
-            }
-        }
-        Expr::Select { c, a, b } => {
-            rep_var_names(c, acc);
-            rep_var_names(a, acc);
-            rep_var_names(b, acc);
-        }
-        Expr::Simd { args, .. } => {
-            for a in args {
-                rep_var_names(a, acc);
-            }
-        }
-        _ => {}
-    }
+/// Variable slots mentioned in `e` (pass-author toolkit).
+pub fn rep_vars(e: &Expr, acc: &mut Vec<Var>) {
+    e.vars(acc);
 }
 
 /// Pre-order statement sequence numbers for def/use order checks:
 /// `defs[name]` = seqs of `name = ...` assigns, `uses[name]` = seqs of
 /// statements whose expressions mention `name` (including a self-copy RHS).
-fn collect_seq_expr(e: &Expr, seq: usize, uses: &mut HashMap<String, Vec<usize>>) {
+fn collect_seq_expr(e: &Expr, seq: usize, uses: &mut HashMap<Var, Vec<usize>>) {
     match e {
-        Expr::Local(i) => uses.entry(format!("l{i}")).or_default().push(seq),
-        Expr::Tmp(i) => uses.entry(format!("t{i}")).or_default().push(seq),
+        Expr::Local(i) => uses.entry(Var::Local(*i)).or_default().push(seq),
+        Expr::Tmp(i) => uses.entry(Var::Tmp(*i)).or_default().push(seq),
+        Expr::Global(i) => uses.entry(Var::Global(*i)).or_default().push(seq),
         Expr::Binop { lhs, rhs, .. } => {
             collect_seq_expr(lhs, seq, uses);
             collect_seq_expr(rhs, seq, uses);
@@ -774,15 +710,17 @@ fn collect_seq_expr(e: &Expr, seq: usize, uses: &mut HashMap<String, Vec<usize>>
 pub fn collect_def_use_seq(
     stmts: &[Stmt],
     seq: &mut usize,
-    defs: &mut HashMap<String, Vec<usize>>,
-    uses: &mut HashMap<String, Vec<usize>>,
+    defs: &mut HashMap<Var, Vec<usize>>,
+    uses: &mut HashMap<Var, Vec<usize>>,
 ) {
     for s in stmts {
         let cur = *seq;
         *seq += 1;
         match s {
             Stmt::Assign { dst, expr } => {
-                defs.entry(dst.clone()).or_default().push(cur);
+                if let Some(v) = Var::parse(dst) {
+                    defs.entry(v).or_default().push(cur);
+                }
                 collect_seq_expr(expr, cur, uses);
             }
             Stmt::Store { base, value, .. } => {
@@ -812,10 +750,10 @@ pub fn collect_def_use_seq(
 /// Substitute ALL names in `map` in a single walk (perf: one O(n) pass
 /// instead of one full rescan per inlined variable). Records which names
 /// actually hit so callers only remove dead defs that were consumed.
-fn subst_all_in_expr(e: &mut Expr, map: &HashMap<String, Expr>, hit: &mut HashSet<String>) -> bool {
+fn subst_all_in_expr(e: &mut Expr, map: &HashMap<Var, Expr>, hit: &mut HashSet<Var>) -> bool {
     match e {
         Expr::Local(i) => {
-            let k = format!("l{i}");
+            let k = Var::Local(*i);
             if let Some(rep) = map.get(&k) {
                 *e = rep.clone();
                 hit.insert(k);
@@ -824,7 +762,7 @@ fn subst_all_in_expr(e: &mut Expr, map: &HashMap<String, Expr>, hit: &mut HashSe
             false
         }
         Expr::Tmp(i) => {
-            let k = format!("t{i}");
+            let k = Var::Tmp(*i);
             if let Some(rep) = map.get(&k) {
                 *e = rep.clone();
                 hit.insert(k);
@@ -867,11 +805,11 @@ fn subst_all_in_expr(e: &mut Expr, map: &HashMap<String, Expr>, hit: &mut HashSe
     }
 }
 
-/// Substitute every name in `map` in one walk; records hits (pass-author toolkit)
- pub fn subst_all_in_stmts(
+/// Substitute every name in `map` in one walk; records hits (pass-author toolkit).
+pub fn subst_all_in_stmts(
     stmts: &mut [Stmt],
-    map: &HashMap<String, Expr>,
-    hit: &mut HashSet<String>,
+    map: &HashMap<Var, Expr>,
+    hit: &mut HashSet<Var>,
 ) -> bool {
     let mut h = false;
     for s in stmts.iter_mut() {
@@ -903,10 +841,9 @@ fn subst_all_in_expr(e: &mut Expr, map: &HashMap<String, Expr>, hit: &mut HashSe
     h
 }
 
-/// Remove all dead `name = ...` assigns in one sweep (perf: single O(n)
-/// pass instead of one O(n) `Vec::remove` memmove per variable).
-/// Remove all `name = ...` assigns in `dead` in one sweep.
-pub fn sweep_assigns(stmts: &mut Vec<Stmt>, dead: &HashSet<String>) -> bool {
+/// Remove all dead assigns in one sweep (perf: single O(n) pass instead
+/// of one O(n) `Vec::remove` memmove per variable).
+pub fn sweep_assigns(stmts: &mut Vec<Stmt>, dead: &HashSet<Var>) -> bool {
     let mut changed = false;
     for s in stmts.iter_mut() {
         match s {
@@ -922,7 +859,7 @@ pub fn sweep_assigns(stmts: &mut Vec<Stmt>, dead: &HashSet<String>) -> bool {
     }
     let before = stmts.len();
     stmts.retain(|s| match s {
-        Stmt::Assign { dst, .. } => !dead.contains(dst),
+        Stmt::Assign { dst, .. } => Var::parse(dst).map_or(true, |v| !dead.contains(&v)),
         _ => true,
     });
     changed || stmts.len() != before
@@ -943,24 +880,33 @@ fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap
             let mut assigns = HashMap::new();
             collect_assigns_loop(stmts, false, &mut assigns);
             // def/use sequence numbers for the order guard below
-            let mut def_seqs: HashMap<String, Vec<usize>> = HashMap::new();
-            let mut use_seqs: HashMap<String, Vec<usize>> = HashMap::new();
+            let mut def_seqs: HashMap<Var, Vec<usize>> = HashMap::new();
+            let mut use_seqs: HashMap<Var, Vec<usize>> = HashMap::new();
             {
                 let mut seq = 0usize;
                 collect_def_use_seq(stmts, &mut seq, &mut def_seqs, &mut use_seqs);
             }
-            let mut names: Vec<&String> = assigns.keys().collect();
-            names.sort();
-            let mut batch: Vec<(String, Expr)> = Vec::new();
-            for dst in names {
-                let (expr, n, in_loop) = &assigns[dst];
-                if *n != 1 || uses.get(dst).copied().unwrap_or(0) != 1 || expr_depth(expr) > 3 {
+            // Sort by rendered name: same candidate order as the old
+            // string-keyed version, so output is byte-identical. Names are
+            // rendered once per round, not per comparison (perf: sort_by
+            // with inline rendering allocates 2 Strings per comparison).
+            let mut names: Vec<(&Var, String)> =
+                assigns.keys().map(|v| (v, v.name())).collect();
+            names.sort_by(|a, b| a.1.cmp(&b.1));
+            let mut batch: Vec<(Var, Expr)> = Vec::new();
+            for (dst, _) in names {
+                // Only locals/tmps inline: globals (gN) are cross-function
+                // visible, so their assignments always stand (as before).
+                if !matches!(dst, Var::Local(_) | Var::Tmp(_)) {
                     continue;
                 }
-                let is_tmp = dst.starts_with('t');
+                let (expr, n, in_loop) = &assigns[dst];
+                if *n != 1 || uses.get(dst).copied().unwrap_or(0) != 1 || expr.depth() > 3 {
+                    continue;
+                }
                 // Locals propagate only when the single definition sits
                 // outside any loop (no loop-carried redefinition).
-                if !is_tmp && *in_loop {
+                if !dst.is_tmp() && *in_loop {
                     continue;
                 }
                 // Order guard (accuracy): the single def (D) must precede
@@ -970,14 +916,14 @@ fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap
                 // with l2 clobbered turned q+r into r+r; same for param
                 // sources clobbered after the copy).
                 let order_ok = match (
-                    def_seqs.get(dst.as_str()).and_then(|v| v.first()),
-                    use_seqs.get(dst.as_str()).and_then(|v| v.first()),
+                    def_seqs.get(dst).and_then(|v| v.first()),
+                    use_seqs.get(dst).and_then(|v| v.first()),
                 ) {
                     (Some(&d), Some(&u)) if d <= u => {
                         let mut reps = Vec::new();
-                        rep_var_names(expr, &mut reps);
+                        expr.vars(&mut reps);
                         !reps.iter().any(|v| {
-                            def_seqs.get(v.as_str()).map_or(false, |ss| {
+                            def_seqs.get(v).map_or(false, |ss| {
                                 ss.iter().any(|&s| s > d && s < u)
                             })
                         })
@@ -987,15 +933,15 @@ fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap
                 if !order_ok {
                     continue;
                 }
-                let inlineable = is_pure(expr)
+                let inlineable = expr.is_pure()
                     || matches!(
                         expr,
                         Expr::Call { .. } | Expr::CallIndirect { .. } | Expr::Load { .. }
                     )
                     || matches!(expr, Expr::Simd { op, args }
-                        if args.iter().all(is_pure) && !simd_has_effect(op));
+                        if args.iter().all(|a| a.is_pure()) && !simd_has_effect(op));
                 if inlineable {
-                    batch.push(((*dst).clone(), expr.clone()));
+                    batch.push((*dst, expr.clone()));
                 }
             }
             if batch.is_empty() {
@@ -1003,15 +949,15 @@ fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap
             }
             // Defer candidates whose rep mentions another candidate this
             // round (staged substitution would go stale).
-            let batch_names: HashSet<&str> = batch.iter().map(|(n, _)| n.as_str()).collect();
-            let mut map: HashMap<String, Expr> = HashMap::new();
+            let batch_names: HashSet<&Var> = batch.iter().map(|(n, _)| n).collect();
+            let mut map: HashMap<Var, Expr> = HashMap::new();
             for (name, rep) in &batch {
                 let mut reps = Vec::new();
-                rep_var_names(rep, &mut reps);
-                if reps.iter().any(|v| batch_names.contains(v.as_str())) {
+                rep.vars(&mut reps);
+                if reps.iter().any(|v| batch_names.contains(v)) {
                     continue;
                 }
-                map.insert(name.clone(), rep.clone());
+                map.insert(*name, rep.clone());
             }
             if map.is_empty() {
                 // All candidates overlap (dependency chain): fall back to a
@@ -1022,15 +968,14 @@ fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap
             // record simple local->local aliases for struct-layout keys
             for (name, rep) in &map {
                 if let Expr::Local(m) = rep {
-                    aliases.insert(name.clone(), format!("l{m}"));
+                    aliases.insert(name.name(), format!("l{m}"));
                 }
             }
             let mut hit = HashSet::new();
             if subst_all_in_stmts(stmts, &map, &mut hit) {
                 // Only sweep defs that were actually consumed; a candidate
                 // whose single use vanished (DCE interplay) keeps its def.
-                let dead: HashSet<String> = hit.into_iter().collect();
-                sweep_assigns(stmts, &dead);
+                sweep_assigns(stmts, &hit);
                 changed = true;
             } else {
                 break;
@@ -1170,16 +1115,14 @@ fn simplify_list(stmts: &mut Vec<Stmt>, labels: &HashSet<String>) -> bool {
 fn split_init_stores(f: &mut FuncIR) -> bool {
     // offsets with ANY i32 (4-byte) access evidence (raw accesses, not merged
     // widths: the i64 store itself would otherwise widen the field to 8).
-    let mut i32_offs: HashMap<String, HashSet<u64>> = HashMap::new();
+    let mut i32_offs: HashMap<Var, HashSet<u64>> = HashMap::new();
     for a in &f.accesses {
-        if a.base_desc == "expr" {
+        // `Var::parse` rejects the "expr" bucket and anything non-var.
+        let Some(k) = Var::parse(&a.base_desc) else {
             continue;
-        }
+        };
         if a.width == 4 {
-            i32_offs
-                .entry(a.base_desc.clone())
-                .or_default()
-                .insert(a.offset);
+            i32_offs.entry(k).or_default().insert(a.offset);
         }
     }
     if i32_offs.is_empty() {
@@ -1188,16 +1131,16 @@ fn split_init_stores(f: &mut FuncIR) -> bool {
     split_in_list(&mut f.body, &i32_offs)
 }
 
-fn base_key(e: &Expr) -> Option<String> {
+fn base_key(e: &Expr) -> Option<Var> {
     match e {
-        Expr::Local(i) => Some(format!("l{i}")),
-        Expr::Tmp(i) => Some(format!("t{i}")),
-        Expr::Global(i) => Some(format!("g{i}")),
+        Expr::Local(i) => Some(Var::Local(*i)),
+        Expr::Tmp(i) => Some(Var::Tmp(*i)),
+        Expr::Global(i) => Some(Var::Global(*i)),
         _ => None,
     }
 }
 
-fn split_in_list(stmts: &mut Vec<Stmt>, fields: &HashMap<String, HashSet<u64>>) -> bool {
+fn split_in_list(stmts: &mut Vec<Stmt>, fields: &HashMap<Var, HashSet<u64>>) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i < stmts.len() {

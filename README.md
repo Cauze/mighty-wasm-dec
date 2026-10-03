@@ -93,8 +93,3 @@ built via `woodpecker-cli exec --backend-engine docker .woodpecker/corpus.yml`.
 Opt-in large target: SQLite (`corpus/wasm/sqlite3.wasm`, 4265 funcs) via
 `.woodpecker/corpus-sqlite.yml`. Also exercised: `lua_worker.wasm` (896
 funcs), Flare `main.wasm` (3255 funcs).
-
-Next: typed `Var` ids (replacing `"l{i}"` strings), `Expr` method surface,
-CFG/dominator analysis for path-sensitive passes, inter-proc pass
-scheduling, remaining coverage gaps (legacy exceptions, stack-switching —
-see `corpus/COVERAGE.md`).

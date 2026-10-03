@@ -34,6 +34,53 @@ impl fmt::Display for WasmTy {
     }
 }
 
+/// A named value slot: wasm local, synthetic tmp, or global.
+/// Typed replacement for `"l{i}"`/`"t{i}"`/`"g{i}"` strings in pass maps —
+/// integer comparison instead of `format!` + string compare per node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Var {
+    Local(u32),
+    Tmp(u32),
+    Global(u32),
+}
+
+impl Var {
+    /// Rendered name (`l3`, `t0`, `g1`); matches the historical strings so
+    /// sort order and diagnostics are unchanged.
+    pub fn name(&self) -> String {
+        match self {
+            Var::Local(i) => format!("l{i}"),
+            Var::Tmp(i) => format!("t{i}"),
+            Var::Global(i) => format!("g{i}"),
+        }
+    }
+
+    /// Parse a `dst`-style name; `None` for struct keys etc.
+    pub fn parse(s: &str) -> Option<Var> {
+        if s.len() < 2 || !s.is_ascii() {
+            return None;
+        }
+        let (k, rest) = (&s[..1], &s[1..]);
+        let i: u32 = rest.parse().ok()?;
+        match k {
+            "l" => Some(Var::Local(i)),
+            "t" => Some(Var::Tmp(i)),
+            "g" => Some(Var::Global(i)),
+            _ => None,
+        }
+    }
+
+    pub fn is_tmp(&self) -> bool {
+        matches!(self, Var::Tmp(_))
+    }
+}
+
+impl fmt::Display for Var {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     ConstI32(i32),
@@ -85,6 +132,94 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// True if evaluating this has no observable effect (safe to
+    /// duplicate or eliminate).
+    pub fn is_pure(&self) -> bool {
+        match self {
+            Expr::ConstI32(_)
+            | Expr::ConstI64(_)
+            | Expr::ConstF32(_)
+            | Expr::ConstF64(_)
+            | Expr::Local(_)
+            | Expr::Tmp(_)
+            | Expr::Global(_) => true,
+            Expr::Binop { lhs, rhs, .. } => lhs.is_pure() && rhs.is_pure(),
+            Expr::Unop { v, .. } => v.is_pure(),
+            Expr::Select { c, a, b } => c.is_pure() && a.is_pure() && b.is_pure(),
+            _ => false,
+        }
+    }
+
+    /// Expression-tree depth (inlining budget heuristic).
+    pub fn depth(&self) -> usize {
+        match self {
+            Expr::Binop { lhs, rhs, .. } => 1 + lhs.depth().max(rhs.depth()),
+            Expr::Unop { v, .. } => 1 + v.depth(),
+            Expr::Select { c, a, b } => 1 + c.depth().max(a.depth().max(b.depth())),
+            Expr::Load { base, .. } => 1 + base.depth(),
+            Expr::Call { args, .. } => 1 + args.iter().map(|a| a.depth()).max().unwrap_or(0),
+            Expr::CallIndirect { index, args, .. } => {
+                1 + index.depth().max(args.iter().map(|a| a.depth()).max().unwrap_or(0))
+            }
+            _ => 0,
+        }
+    }
+
+    /// Variable slots mentioned in this expression.
+    pub fn vars(&self, acc: &mut Vec<Var>) {
+        match self {
+            Expr::Local(i) => acc.push(Var::Local(*i)),
+            Expr::Tmp(i) => acc.push(Var::Tmp(*i)),
+            Expr::Global(i) => acc.push(Var::Global(*i)),
+            Expr::Binop { lhs, rhs, .. } => {
+                lhs.vars(acc);
+                rhs.vars(acc);
+            }
+            Expr::Unop { v, .. } => v.vars(acc),
+            Expr::Load { base, .. } => base.vars(acc),
+            Expr::Call { args, .. } => {
+                for a in args {
+                    a.vars(acc);
+                }
+            }
+            Expr::CallIndirect { index, args, .. } => {
+                index.vars(acc);
+                for a in args {
+                    a.vars(acc);
+                }
+            }
+            Expr::Select { c, a, b } => {
+                c.vars(acc);
+                a.vars(acc);
+                b.vars(acc);
+            }
+            Expr::Simd { args, .. } => {
+                for a in args {
+                    a.vars(acc);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Strip conversion-cast wrappers (`(uint32_t)`, `(int64_t)`, …) to the
+    /// core expression. Casts are pure, so stripping for *recognition* is
+    /// sound (rewrites re-cast as needed).
+    pub fn strip_casts(&self) -> &Expr {
+        let mut cur = self;
+        loop {
+            match cur {
+                Expr::Unop { op, v }
+                    if (op.starts_with("(u") || op.starts_with("(i"))
+                        && op.ends_with(')') =>
+                {
+                    cur = v;
+                }
+                _ => return cur,
+            }
+        }
+    }
+
     pub fn render(&self) -> String {
         match self {
             Expr::ConstI32(v) => format!("{v}"),
