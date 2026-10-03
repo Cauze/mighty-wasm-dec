@@ -1003,7 +1003,10 @@ fn order_ok_seq(
 /// Dominance order check for bodies with control flow: the single def
 /// block dominates the single use block, and no rep-var def sits on any
 /// def→use path (endpoints excluded, as in the seq check).
-fn cfg_order_ok(g: &cfg::Cfg, dom: &[HashSet<cfg::BlockId>], dst: Var, expr: &Expr) -> bool {
+/// Bitset doms + early-exit `has_def_between` (no per-candidate HashSet
+/// DFS + intersection); skips walks entirely when the expr mentions no
+/// vars or no rep defs exist outside the endpoints.
+fn cfg_order_ok(g: &cfg::Cfg, dom: &[Vec<u64>], dst: Var, expr: &Expr) -> bool {
     let (Some(d), Some(u)) = (
         g.def_blocks.get(&dst).and_then(|v| match v[..] {
             [only] => Some(only),
@@ -1016,24 +1019,37 @@ fn cfg_order_ok(g: &cfg::Cfg, dom: &[HashSet<cfg::BlockId>], dst: Var, expr: &Ex
     ) else {
         return false;
     };
-    if !cfg::dominates(dom, d, u) {
+    if !cfg::dominates_bits(dom, d, u) {
         return false;
     }
     let mut reps = Vec::new();
     expr.vars(&mut reps);
-    let between = cfg::blocks_between(g, d, u);
-    !reps.iter().any(|v| {
-        g.def_blocks.get(v).map_or(false, |bs| {
-            bs.iter().any(|&b| b != d && b != u && between.contains(&b))
-        })
-    })
+    if reps.is_empty() {
+        return true;
+    }
+    let mut rep_blocks: Vec<cfg::BlockId> = Vec::new();
+    for v in &reps {
+        if let Some(bs) = g.def_blocks.get(v) {
+            for &b in bs {
+                if b != d && b != u {
+                    rep_blocks.push(b);
+                }
+            }
+        }
+    }
+    if rep_blocks.is_empty() {
+        return true;
+    }
+    !cfg::has_def_between(g, d, u, &rep_blocks)
 }
 
 /// Max Block/Loop/If nesting for the CFG order guard. Deep dispatch
-/// scaffolding (f2422: ~990) falls back to the positional check:
-/// iterative dataflow cost scales with depth. 256 keeps real functions
-/// (sqlite3VdbeExec nests well under 100) on the precise path.
-const CFG_DEPTH_LIMIT: usize = 256;
+/// scaffolding (f2422: ~4547) falls back to the positional check;
+/// bitset+RPO dataflow + dom reuse keep the CFG path cheap well past
+/// real-code depths (sqlite3 max 273 in yy_reduce, VdbeExec well under
+/// 100). 2000 covers all real functions with headroom while excluding
+/// pathological dispatch.
+const CFG_DEPTH_LIMIT: usize = 2000;
 
 /// Max Block/Loop/If nesting depth (early-out past the limit).
 fn nesting_depth(stmts: &[Stmt]) -> usize {
@@ -1089,18 +1105,22 @@ fn inline_and_dce(
     // mentions another candidate are deferred to the next round so staged
     // substitutions never go stale (t1 = f(t0) waits for t0).
     if opt.inline {
+        // CFG order-guard setup, hoisted out of the round loop:
+        // `has_control_flow` only sees top-level Block/Loop/If/Br, which
+        // inline rounds never add/remove (subst touches exprs, sweep drops
+        // only Assigns), so the decision is stable across rounds.
+        let want_cfg = cfg_guard && has_control_flow(stmts);
+        // Dominator cache: CFG topology is likewise invariant across inline
+        // rounds, so the expensive dom survives; the cheap fingerprint
+        // (O(n+e) per round) detects the impossible change and recomputes,
+        // preserving exact decisions.
+        let mut cached_fp: Option<u64> = None;
+        let mut cached_dom: Vec<Vec<u64>> = Vec::new();
         loop {
             let mut uses = HashMap::new();
             count_uses_stmts(stmts, &mut uses);
             let mut assigns = HashMap::new();
             collect_assigns_loop(stmts, false, &mut assigns);
-            // def/use sequence numbers for the order guard below
-            let mut def_seqs: HashMap<Var, Vec<usize>> = HashMap::new();
-            let mut use_seqs: HashMap<Var, Vec<usize>> = HashMap::new();
-            {
-                let mut seq = 0usize;
-                collect_def_use_seq(stmts, &mut seq, &mut def_seqs, &mut use_seqs);
-            }
             // Sort by rendered name: same candidate order as the old
             // string-keyed version, so output is byte-identical. Names are
             // rendered once per round, not per comparison (perf: sort_by
@@ -1142,20 +1162,31 @@ fn inline_and_dce(
             }
             // Stage 2: order guard. Straight-line bodies use the positional
             // check (exact there, and free); control flow gets real
-            // dominance from a per-round CFG (seq numbers lie across
-            // branches). Deep-nesting monsters (f2422: ~990 levels) fall
-            // back to seq: iterative dataflow cost scales with depth,
-            // and dispatch scaffolding that deep gains nothing from it.
-            // See docs/CFG_FULL_PLAN.md Phase B.
-            if has_control_flow(stmts) && cfg_guard {
+            // dominance from the CFG (seq numbers lie across branches).
+            // Bitset + RPO dataflow with RPO convergence and per-round dom
+            // reuse (topology never changes here) keeps even ~1000-deep
+            // dispatch scaffolding cheap. See docs/CFG_FULL_PLAN.md Phase B.
+            if want_cfg {
                 let g = cfg::build(stmts);
-                let dom = cfg::dominators(&g);
+                let fp = cfg::topo_fingerprint(&g);
+                if cached_fp != Some(fp) {
+                    cached_dom = cfg::dominators_bitset(&g);
+                    cached_fp = Some(fp);
+                }
                 for (dst, expr) in maybe {
-                    if cfg_order_ok(&g, &dom, dst, &expr) {
+                    if cfg_order_ok(&g, &cached_dom, dst, &expr) {
                         batch.push((dst, expr));
                     }
                 }
             } else {
+                // Seq maps computed lazily only for the seq path (saves a
+                // full walk + HashMaps per round when the CFG path is taken).
+                let mut def_seqs: HashMap<Var, Vec<usize>> = HashMap::new();
+                let mut use_seqs: HashMap<Var, Vec<usize>> = HashMap::new();
+                {
+                    let mut seq = 0usize;
+                    collect_def_use_seq(stmts, &mut seq, &mut def_seqs, &mut use_seqs);
+                }
                 for (dst, expr) in maybe {
                     let mut reps = Vec::new();
                     expr.vars(&mut reps);

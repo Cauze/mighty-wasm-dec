@@ -31,20 +31,22 @@ New `src/cfg.rs` (public API):
   use-block + no rep-var def in `blocks_between` (endpoints excluded,
   matching seq semantics). Straight-line bodies keep the positional
   check (exact, free).
-- Scale gate (found via f2422: ungated CFG guard took 230s on its ~990
-  nesting vs 0.5s seq): `nesting_depth > 256` falls back to seq,
-  decided ONCE per function (round-varying measurement flips paths
-  mid-fixpoint). f2422 now 0.4s with all 13,971 dispatch cases intact.
-  `cfgdump` got the same 512MB-stack treatment after overflowing on it.
-- Differential result on 30-file corpus: 27 identical; 3 reviewed —
-  `bon` (genuine miscompile fixed: branch-skipped def no longer inlined
-  into the join), `recursion/fib` (converged identical after teaching
-  the CFG that `tee`-residue self-copies aren't defs), full `sqlite3`
-  (6 `table_call` tmps across a 13-way dispatch stay un-inlined:
-  conservative-but-correct, accepted).
-- DEFERRED: transitive inline composition (chain cliff stays: ~85s
-  debug pre-existing, unchanged), cross-branch DCE. Both need the
-  fixpoint-behavior review this phase didn't have room for.
+- Scale story (perf subagent, see below): bitset+RPO dominators
+  (~1000× on f2422's dom: >120s → 93ms), dom reuse across inline
+  rounds via topology fingerprint, per-candidate walks replaced by
+  `has_def_between` with fast-path skips, lazy seq maps. Gate is now
+  2000, not 256: f2422 (4547 deep) stays seq, everything else
+  (sqlite3 max 273) takes CFG. Full sqlite3 module: 32.5s → 1.17s.
+  Gate NOT removed: seq/CFG legitimately disagree on monsters
+  (f2422 CFG output diverges ~57k lines — conservative tmp-keeping
+  either way), so 2000 keeps all baselines identical with headroom.
+- Differential result: `bon` (genuine miscompile fixed:
+  branch-skipped def no longer inlined into the join),
+  `recursion/fib` (converged identical after teaching the CFG that
+  `tee`-residue self-copies aren't defs).
+- DEFERRED: transitive inline composition (chain cliff stays),
+  cross-branch DCE. Both need the fixpoint-behavior review this
+  phase didn't have room for.
 
 ## Phase C — Module passes (#4) [DONE, driver deferred]
 

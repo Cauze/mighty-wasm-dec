@@ -395,64 +395,304 @@ fn push_dead(s: &Stmt, b: &mut Builder) {
     }
 }
 
-/// Dominator sets (iterative dataflow): `dom[b]` contains `b` and every
-/// block on all paths from entry to `b`. Unreachable blocks dominate
-/// only themselves.
-pub fn dominators(cfg: &Cfg) -> Vec<HashSet<BlockId>> {
+/// Dominator sets as bitsets (fast path): `dom[b]` has bit `a` set iff `a`
+/// dominates `b`. Same equations as [`dominators`], but `Vec<u64>` words +
+/// reverse-postorder iteration instead of `HashSet` + `0..n` order.
+/// On deep nesting (f2422: 30k blocks, ~990 depth) the old version needed
+/// ~depth fixpoint passes over HashSet intersections (>120s for one call);
+/// RPO converges in ~2-3 passes and each intersection is a few `AND`s
+/// (~tens of ms). No new deps — hand-rolled bitsets.
+pub fn dominators_bitset(cfg: &Cfg) -> Vec<Vec<u64>> {
     let n = cfg.blocks.len();
-    let all: HashSet<BlockId> = (0..n).collect();
-    let mut dom: Vec<HashSet<BlockId>> = vec![HashSet::new(); n];
-    dom[cfg.entry] = HashSet::from([cfg.entry]);
-    let mut reach = HashSet::from([cfg.entry]);
-    let mut stack = vec![cfg.entry];
-    while let Some(x) = stack.pop() {
-        for s in succ_of(&cfg.blocks[x]) {
-            if reach.insert(s) {
-                stack.push(s);
-            }
-        }
+    if n == 0 {
+        return Vec::new();
     }
-    for blk in 0..n {
-        if blk == cfg.entry {
-            continue;
-        }
-        dom[blk] = if reach.contains(&blk) {
-            all.clone()
-        } else {
-            HashSet::from([blk])
-        };
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for blk in 0..n {
-            if blk == cfg.entry || !reach.contains(&blk) {
+    let words = (n + 63) / 64;
+    // Reachable set + reverse postorder from entry (iterative, no recursion:
+    // real inputs nest ~1000 deep and overflow the stack with recursion).
+    let mut reach = vec![false; n];
+    let mut post: Vec<BlockId> = Vec::with_capacity(n);
+    {
+        let mut visited = vec![false; n];
+        // (node, exiting): false = enter, true = exit (postorder emit)
+        let mut stack: Vec<(BlockId, bool)> = vec![(cfg.entry, false)];
+        while let Some((x, exiting)) = stack.pop() {
+            if x >= n {
                 continue;
             }
-            let preds = &cfg.blocks[blk].preds;
+            if exiting {
+                post.push(x);
+                continue;
+            }
+            if visited[x] {
+                continue;
+            }
+            visited[x] = true;
+            stack.push((x, true));
+            // push successors (inline succ_of to avoid per-node Vec alloc)
+            match &cfg.blocks[x].term {
+                Terminator::Next(t) | Terminator::Jump(t) => {
+                    if *t < n && !visited[*t] {
+                        stack.push((*t, false));
+                    }
+                }
+                Terminator::Branch { then_b, else_b, .. } => {
+                    if *else_b < n && !visited[*else_b] {
+                        stack.push((*else_b, false));
+                    }
+                    if *then_b != usize::MAX && *then_b < n && !visited[*then_b] {
+                        stack.push((*then_b, false));
+                    }
+                }
+                Terminator::Switch { arms, default, .. } => {
+                    if *default < n && !visited[*default] {
+                        stack.push((*default, false));
+                    }
+                    for a in arms.iter().rev() {
+                        if *a < n && !visited[*a] {
+                            stack.push((*a, false));
+                        }
+                    }
+                }
+                Terminator::Return(_) | Terminator::Unreachable => {}
+            }
+        }
+        reach = visited;
+    }
+    let mut rpo: Vec<BlockId> = post;
+    rpo.reverse();
+    // Init: entry={entry}, unreachable={self}, reachable=all (as in old code).
+    let mut dom: Vec<Vec<u64>> = vec![vec![0u64; words]; n];
+    let excess = words * 64 - n;
+    let last_mask: u64 = if excess == 0 { !0u64 } else { !0u64 >> excess };
+    for b in 0..n {
+        if b == cfg.entry || !reach[b] {
+            dom[b][b / 64] |= 1u64 << (b % 64);
+        } else {
+            for w in &mut dom[b] {
+                *w = !0u64;
+            }
+            dom[b][words - 1] &= last_mask;
+        }
+    }
+    // Fixpoint in RPO (entry first, skip entry/unreachable).
+    let mut changed = true;
+    // Reusable scratch to avoid per-block alloc (30k allocs per pass otherwise).
+    let mut new_row = vec![0u64; words];
+    while changed {
+        changed = false;
+        for &b in &rpo {
+            if b == cfg.entry || !reach[b] {
+                continue;
+            }
+            let preds = &cfg.blocks[b].preds;
             if preds.is_empty() {
                 continue;
             }
-            let mut new: Option<HashSet<BlockId>> = None;
-            for p in preds {
-                if !reach.contains(p) {
+            // first reachable pred
+            let mut first: Option<usize> = None;
+            for &p in preds {
+                if p < n && reach[p] {
+                    first = Some(p);
+                    break;
+                }
+            }
+            let Some(f0) = first else {
+                continue;
+            };
+            new_row.copy_from_slice(&dom[f0]);
+            for &p in preds {
+                if p == f0 || p >= n || !reach[p] {
                     continue;
                 }
-                new = Some(match new {
-                    None => dom[*p].clone(),
-                    Some(acc) => acc.intersection(&dom[*p]).copied().collect(),
-                });
-            }
-            if let Some(mut set) = new {
-                set.insert(blk);
-                if set != dom[blk] {
-                    dom[blk] = set;
-                    changed = true;
+                let row = &dom[p];
+                for (d, s) in new_row.iter_mut().zip(row.iter()) {
+                    *d &= *s;
                 }
+            }
+            new_row[b / 64] |= 1u64 << (b % 64);
+            if new_row != dom[b] {
+                dom[b].copy_from_slice(&new_row);
+                changed = true;
             }
         }
     }
     dom
+}
+
+/// Does `a` dominate `b` on bitset doms (see [`dominators_bitset`])?
+pub fn dominates_bits(dom: &[Vec<u64>], a: BlockId, b: BlockId) -> bool {
+    dom.get(b)
+        .map_or(false, |row| a / 64 < row.len() && (row[a / 64] >> (a % 64)) & 1 == 1)
+}
+
+/// Topology fingerprint for dom reuse across inline rounds: blocks/edges
+/// only (not def/use maps). `inline_and_dce` never adds/removes control
+/// flow, so the fingerprint is stable and the (expensive) dom survives;
+/// if it ever changes we recompute, preserving exact decisions.
+pub fn topo_fingerprint(cfg: &Cfg) -> u64 {
+    let mut h: u64 = cfg.blocks.len() as u64;
+    for b in &cfg.blocks {
+        h = h.wrapping_mul(31).wrapping_add(b.preds.len() as u64);
+        match &b.term {
+            Terminator::Next(t) | Terminator::Jump(t) => {
+                h = h.wrapping_mul(31).wrapping_add(*t as u64);
+            }
+            Terminator::Branch { then_b, else_b, .. } => {
+                h = h.wrapping_mul(31).wrapping_add(*else_b as u64);
+                h = h.wrapping_mul(31).wrapping_add(*then_b as u64);
+            }
+            Terminator::Switch { arms, default, .. } => {
+                h = h.wrapping_mul(31).wrapping_add(*default as u64);
+                for a in arms {
+                    h = h.wrapping_mul(31).wrapping_add(*a as u64);
+                }
+            }
+            Terminator::Return(v) => {
+                h = h.wrapping_mul(31).wrapping_add(0x52_4554 + v.len() as u64);
+            }
+            Terminator::Unreachable => {
+                h = h.wrapping_mul(31).wrapping_add(0xDEAD);
+            }
+        }
+        for p in &b.preds {
+            h = h.wrapping_mul(31).wrapping_add(*p as u64);
+        }
+    }
+    // entry matters (different entry => different doms)
+    h.wrapping_mul(31).wrapping_add(cfg.entry as u64)
+}
+
+/// True if any of `rep_blocks` lies on some path `from`→`to` (exclusive of
+/// endpoints, as in `blocks_between` + endpoint-excluded lookup).
+/// Faster than building two `HashSet`s + intersecting per candidate:
+/// one `Vec<bool>` forward walk + one limited backward walk with early exit,
+/// no hashing, no per-node allocation, skips walks when possible.
+pub fn has_def_between(
+    cfg: &Cfg,
+    from: BlockId,
+    to: BlockId,
+    rep_blocks: &[BlockId],
+) -> bool {
+    if rep_blocks.is_empty() {
+        return false;
+    }
+    let n = cfg.blocks.len();
+    if from >= n || to >= n {
+        return false;
+    }
+    // Membership for rep blocks (endpoints excluded, matching caller).
+    let mut is_rep = vec![false; n];
+    let mut nrep = 0usize;
+    for &r in rep_blocks {
+        if r < n && r != from && r != to && !is_rep[r] {
+            is_rep[r] = true;
+            nrep += 1;
+        }
+    }
+    if nrep == 0 {
+        return false;
+    }
+    // Forward reachable from `from`.
+    let mut fwd = vec![false; n];
+    {
+        let mut stack = vec![from];
+        fwd[from] = true;
+        while let Some(x) = stack.pop() {
+            // inline succ_of (no alloc)
+            match &cfg.blocks[x].term {
+                Terminator::Next(t) | Terminator::Jump(t) => {
+                    if *t < n && !fwd[*t] {
+                        fwd[*t] = true;
+                        stack.push(*t);
+                    }
+                }
+                Terminator::Branch { then_b, else_b, .. } => {
+                    if *else_b < n && !fwd[*else_b] {
+                        fwd[*else_b] = true;
+                        stack.push(*else_b);
+                    }
+                    if *then_b != usize::MAX && *then_b < n && !fwd[*then_b] {
+                        fwd[*then_b] = true;
+                        stack.push(*then_b);
+                    }
+                }
+                Terminator::Switch { arms, default, .. } => {
+                    if *default < n && !fwd[*default] {
+                        fwd[*default] = true;
+                        stack.push(*default);
+                    }
+                    for a in arms {
+                        if *a < n && !fwd[*a] {
+                            fwd[*a] = true;
+                            stack.push(*a);
+                        }
+                    }
+                }
+                Terminator::Return(_) | Terminator::Unreachable => {}
+            }
+        }
+    }
+    // If no rep block is even forward-reachable, no back walk needed.
+    let mut any_fwd = false;
+    for &r in rep_blocks {
+        if r < n && fwd[r] && is_rep[r] {
+            any_fwd = true;
+            break;
+        }
+    }
+    if !any_fwd {
+        return false;
+    }
+    // Backward walk from `to` limited to fwd, early exit on rep hit.
+    let mut seen = vec![false; n];
+    let mut stack = vec![to];
+    seen[to] = true;
+    // Note: `to` itself is excluded from is_rep, so visiting it never hits.
+    while let Some(x) = stack.pop() {
+        if is_rep[x] {
+            return true;
+        }
+        for p in &cfg.blocks[x].preds {
+            if *p < n && fwd[*p] && !seen[*p] {
+                seen[*p] = true;
+                // early check before push saves one pop per hit
+                if is_rep[*p] {
+                    return true;
+                }
+                stack.push(*p);
+            }
+        }
+    }
+    false
+}
+
+/// Dominator sets (iterative dataflow): `dom[b]` contains `b` and every
+/// block on all paths from entry to `b`. Unreachable blocks dominate
+/// only themselves.
+///
+/// Fast path: computed via bitsets + RPO ([`dominators_bitset`]), then
+/// converted. Same sets as the old `HashSet` dataflow, much faster.
+pub fn dominators(cfg: &Cfg) -> Vec<HashSet<BlockId>> {
+    let bits = dominators_bitset(cfg);
+    let n = cfg.blocks.len();
+    let mut out: Vec<HashSet<BlockId>> = vec![HashSet::new(); n];
+    for (b, row) in bits.iter().enumerate() {
+        let mut set = HashSet::new();
+        for (wi, w) in row.iter().enumerate() {
+            let mut word = *w;
+            while word != 0 {
+                let tz = word.trailing_zeros() as usize;
+                let id = wi * 64 + tz;
+                if id < n {
+                    set.insert(id);
+                }
+                word &= word - 1;
+            }
+        }
+        out[b] = set;
+    }
+    out
 }
 
 /// Does `a` dominate `b` (every entry→`b` path passes through `a`)?
