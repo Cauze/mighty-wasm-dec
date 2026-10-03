@@ -724,6 +724,40 @@ mod tests {
     }
 
     #[test]
+    fn var_parse_and_name() {
+        use mighty_wasm_dec::ir::{Expr, Var};
+        assert_eq!(Var::parse("l3"), Some(Var::Local(3)));
+        assert_eq!(Var::parse("t0"), Some(Var::Tmp(0)));
+        assert_eq!(Var::parse("g12"), Some(Var::Global(12)));
+        assert_eq!(Var::parse(""), None);
+        assert_eq!(Var::parse("l"), None);
+        assert_eq!(Var::parse("expr"), None);
+        assert_eq!(Var::parse("S_0_l0"), None);
+        assert_eq!(Var::Local(10).name(), "l10");
+        assert_eq!(Var::Tmp(1).to_string(), "t1");
+        // Numeric ordering (NOT lexicographic: Local(2) < Local(10), while
+        // "l10" < "l2" as strings — candidate sorting uses name() to keep
+        // the historical order byte-identical).
+        assert!(Var::Local(2) < Var::Local(10));
+        // Expr surface used by passes.
+        let e = Expr::Binop {
+            op: "+".into(),
+            lhs: Box::new(Expr::Local(1)),
+            rhs: Box::new(Expr::ConstI32(5)),
+        };
+        let mut vs = Vec::new();
+        e.vars(&mut vs);
+        assert_eq!(vs, vec![Var::Local(1)]);
+        assert!(e.is_pure());
+        assert_eq!(e.depth(), 1);
+        let casted = Expr::Unop {
+            op: "(uint32_t)".into(),
+            v: Box::new(Expr::Local(2)),
+        };
+        assert!(matches!(casted.strip_casts(), Expr::Local(2)));
+    }
+
+    #[test]
     fn narrow_store_not_widened() {
         // i32 store at +0 with a dominant i64 field there must not render
         // through the 8-byte field (fill_blob: tag store via f_off_0).
