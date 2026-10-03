@@ -543,9 +543,11 @@ mod tests {
     }
 
     #[test]
-    fn loop_fallthrough_exits() {
-        // Clang counted-loop shape: br_if-continue + fallthrough exit.
-        // Without a trailing break the C `while (1)` hangs (fac/control).
+    fn loop_continue_preserved() {
+        // Loop ending in unconditional continue must keep looping.
+        // (An earlier revision dropped the back-edge and the emitter's
+        // fallthrough `break` turned it into loop-exit: wrong-code on
+        // sqlite3_step/VdbeExec. The `br_if` above is the real exit edge.)
         let c = decompile_opt_wat(r#"(module
           (func (param i32) (result i32) (local i32)
             (local.set 1 (i32.const 0))
@@ -553,6 +555,20 @@ mod tests {
               (br_if 1 (i32.ge_s (local.get 1) (local.get 0)))
               (local.set 1 (i32.add (local.get 1) (i32.const 1)))
               (br 0)))
+            (local.get 1)))"#);
+        assert!(c.contains("goto __head_"), "expected loop-back goto, got:\n{c}");
+    }
+
+    #[test]
+    fn loop_fallthrough_exits() {
+        // Genuine fallthrough (no trailing branch): the C `while (1)`
+        // needs the appended break or fac/control-style loops hang.
+        let c = decompile_opt_wat(r#"(module
+          (func (param i32) (result i32) (local i32)
+            (local.set 1 (i32.const 0))
+            (block $exit (loop $l
+              (br_if $exit (i32.ge_s (local.get 1) (local.get 0)))
+              (local.set 1 (i32.add (local.get 1) (i32.const 1)))))
             (local.get 1)))"#);
         assert!(c.contains("break;"), "expected loop-exit break, got:\n{c}");
     }

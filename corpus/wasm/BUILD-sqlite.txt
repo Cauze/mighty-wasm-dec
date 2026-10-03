@@ -4,4 +4,4 @@ This is free and open source software under the MIT license.
 There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
 src: sqlite-amalgamation-3450300 (sqlite3.c)
-flags: -O1 -g -s STANDALONE_WASM=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION=1
+flags: -O1 -g -s LINKABLE=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION=1

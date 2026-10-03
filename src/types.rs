@@ -72,8 +72,10 @@ pub fn recover(func: &FuncIR) -> Vec<StructLayout> {
                 .max_by(|(w1, c1), (w2, c2)| c1.cmp(c2).then(w2.cmp(w1)))
                 .map(|(w, _)| w)
                 .unwrap_or(4);
-            // dominant type among accesses AT the dominant width
-            let mut counts: HashMap<&str, usize> = HashMap::new();
+            // dominant type among accesses AT the dominant width.
+            // BTreeMap (not HashMap): ties must break deterministically,
+            // else struct field types flip run to run (audit §2.3).
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
             for a in &v {
                 if a.width == width {
                     *counts.entry(a.dom_ty.as_str()).or_default() += 1;
@@ -126,7 +128,8 @@ pub fn field_c_ty(f: &Field) -> &'static str {
 pub fn merge_notes(funcs: &[FuncIR]) -> Vec<String> {
     // parent map over (func_idx, base) -> root
     let mut notes = Vec::new();
-    let mut sig_map: HashMap<Vec<u64>, Vec<String>> = HashMap::new();
+    // BTreeMap: note ORDER must be deterministic across runs.
+    let mut sig_map: BTreeMap<Vec<u64>, Vec<String>> = BTreeMap::new();
     for f in funcs {
         let layouts = recover(f);
         for l in layouts {

@@ -994,13 +994,13 @@ fn simplify_list(stmts: &mut Vec<Stmt>, labels: &HashSet<String>) -> bool {
                 }
                 body.is_empty() && !labels.contains(label)
             }            Stmt::Loop { label, body } => {
-                // trailing continue-to-self is redundant
-                if let Some(Stmt::Br { label: l, is_loop: true, .. }) = body.last() {
-                    if l == label {
-                        body.pop();
-                        changed = true;
-                    }
-                }
+                // NOTE: a trailing continue-to-self (`br` to the loop head)
+                // must be KEPT. An earlier revision popped it as "redundant",
+                // but the emitter lowers fallthrough to loop EXIT (appended
+                // `break`), so dropping the back-edge turned loop-back into
+                // loop-exit — silent wrong-code on sqlite3_step/VdbeExec.
+                // (The Block self-break pop above is genuinely safe: a
+                // do/while(0) block falls through to exit anyway.)
                 body.is_empty() && !labels.contains(label)
             }
             Stmt::If { then_b, else_b, .. } => then_b.is_empty() && else_b.is_empty(),
