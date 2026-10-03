@@ -18,8 +18,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --release --verbose
       - name: Test
         run: cargo test --verbose
       - name: Build examples
-        run: cargo build --examples --verbose
+        run: cargo build --examples --release --verbose
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mighty-wasm-dec-${{ matrix.os }}
+          path: |
+            target/release/mighty-wasm-dec
+            target/release/mighty-wasm-dec.exe
