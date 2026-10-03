@@ -563,109 +563,6 @@ pub fn topo_fingerprint(cfg: &Cfg) -> u64 {
     h.wrapping_mul(31).wrapping_add(cfg.entry as u64)
 }
 
-/// True if any of `rep_blocks` lies on some path `from`→`to` (exclusive of
-/// endpoints, as in `blocks_between` + endpoint-excluded lookup).
-/// Faster than building two `HashSet`s + intersecting per candidate:
-/// one `Vec<bool>` forward walk + one limited backward walk with early exit,
-/// no hashing, no per-node allocation, skips walks when possible.
-pub fn has_def_between(
-    cfg: &Cfg,
-    from: BlockId,
-    to: BlockId,
-    rep_blocks: &[BlockId],
-) -> bool {
-    if rep_blocks.is_empty() {
-        return false;
-    }
-    let n = cfg.blocks.len();
-    if from >= n || to >= n {
-        return false;
-    }
-    // Membership for rep blocks (endpoints excluded, matching caller).
-    let mut is_rep = vec![false; n];
-    let mut nrep = 0usize;
-    for &r in rep_blocks {
-        if r < n && r != from && r != to && !is_rep[r] {
-            is_rep[r] = true;
-            nrep += 1;
-        }
-    }
-    if nrep == 0 {
-        return false;
-    }
-    // Forward reachable from `from`.
-    let mut fwd = vec![false; n];
-    {
-        let mut stack = vec![from];
-        fwd[from] = true;
-        while let Some(x) = stack.pop() {
-            // inline succ_of (no alloc)
-            match &cfg.blocks[x].term {
-                Terminator::Next(t) | Terminator::Jump(t) => {
-                    if *t < n && !fwd[*t] {
-                        fwd[*t] = true;
-                        stack.push(*t);
-                    }
-                }
-                Terminator::Branch { then_b, else_b, .. } => {
-                    if *else_b < n && !fwd[*else_b] {
-                        fwd[*else_b] = true;
-                        stack.push(*else_b);
-                    }
-                    if *then_b != usize::MAX && *then_b < n && !fwd[*then_b] {
-                        fwd[*then_b] = true;
-                        stack.push(*then_b);
-                    }
-                }
-                Terminator::Switch { arms, default, .. } => {
-                    if *default < n && !fwd[*default] {
-                        fwd[*default] = true;
-                        stack.push(*default);
-                    }
-                    for a in arms {
-                        if *a < n && !fwd[*a] {
-                            fwd[*a] = true;
-                            stack.push(*a);
-                        }
-                    }
-                }
-                Terminator::Return(_) | Terminator::Unreachable => {}
-            }
-        }
-    }
-    // If no rep block is even forward-reachable, no back walk needed.
-    let mut any_fwd = false;
-    for &r in rep_blocks {
-        if r < n && fwd[r] && is_rep[r] {
-            any_fwd = true;
-            break;
-        }
-    }
-    if !any_fwd {
-        return false;
-    }
-    // Backward walk from `to` limited to fwd, early exit on rep hit.
-    let mut seen = vec![false; n];
-    let mut stack = vec![to];
-    seen[to] = true;
-    // Note: `to` itself is excluded from is_rep, so visiting it never hits.
-    while let Some(x) = stack.pop() {
-        if is_rep[x] {
-            return true;
-        }
-        for p in &cfg.blocks[x].preds {
-            if *p < n && fwd[*p] && !seen[*p] {
-                seen[*p] = true;
-                // early check before push saves one pop per hit
-                if is_rep[*p] {
-                    return true;
-                }
-                stack.push(*p);
-            }
-        }
-    }
-    false
-}
 
 /// Dominator sets (iterative dataflow): `dom[b]` contains `b` and every
 /// block on all paths from entry to `b`. Unreachable blocks dominate
@@ -734,8 +631,84 @@ pub fn reachable(cfg: &Cfg) -> HashSet<BlockId> {
     set
 }
 
-/// Blocks on some path from `from` to `to` (inclusive): forward-reachable
-/// from `from` ∩ can-reach `to`. Used for staleness checks.
+/// True if edge `tail`→`head` closes a loop (head dominates tail).
+/// Used to exclude loop-around paths from staleness checks: a rep-var
+/// def reachable only by looping around executes *after* the use in
+/// iteration order (or re-executes the def itself, covered separately).
+pub fn is_back_edge(dom: &[Vec<u64>], tail: BlockId, head: BlockId) -> bool {
+    dominates_bits(dom, head, tail)
+}
+
+/// Like [`blocks_between`], but ignoring loop-closing back-edges, so the
+/// result is the "same-iteration" region between `from` and `to`.
+/// Linear (two DFS walks, no path enumeration); endpoints included in
+/// the walks but filtered by the caller as before.
+pub fn blocks_between_acyclic(
+    cfg: &Cfg,
+    dom: &[Vec<u64>],
+    from: BlockId,
+    to: BlockId,
+) -> HashSet<BlockId> {
+    fn succ_acyclic(cfg: &Cfg, dom: &[Vec<u64>], x: BlockId, out: &mut Vec<BlockId>) {
+        out.clear();
+        let n = cfg.blocks.len();
+        match &cfg.blocks[x].term {
+            Terminator::Next(t) | Terminator::Jump(t) => {
+                if *t < n && !is_back_edge(dom, x, *t) {
+                    out.push(*t);
+                }
+            }
+            Terminator::Branch { then_b, else_b, .. } => {
+                if *else_b < n && !is_back_edge(dom, x, *else_b) {
+                    out.push(*else_b);
+                }
+                if *then_b != usize::MAX && *then_b < n && !is_back_edge(dom, x, *then_b) {
+                    out.push(*then_b);
+                }
+            }
+            Terminator::Switch { arms, default, .. } => {
+                if *default < n && !is_back_edge(dom, x, *default) {
+                    out.push(*default);
+                }
+                for a in arms {
+                    if *a < n && !is_back_edge(dom, x, *a) {
+                        out.push(*a);
+                    }
+                }
+            }
+            Terminator::Return(_) | Terminator::Unreachable => {}
+        }
+    }
+    let n = cfg.blocks.len();
+    if from >= n || to >= n {
+        return HashSet::new();
+    }
+    let mut fwd = HashSet::new();
+    let mut stack = vec![from];
+    let mut tmp = Vec::new();
+    while let Some(x) = stack.pop() {
+        if !fwd.insert(x) {
+            continue;
+        }
+        succ_acyclic(cfg, dom, x, &mut tmp);
+        stack.extend(tmp.drain(..));
+    }
+    // Backward walk restricted to fwd, skipping back-edges in reverse
+    // (edge p→x is a back-edge iff x dominates p).
+    let mut back = HashSet::new();
+    let mut stack = vec![to];
+    while let Some(x) = stack.pop() {
+        if !back.insert(x) {
+            continue;
+        }
+        for p in &cfg.blocks[x].preds {
+            if *p < n && fwd.contains(p) && !is_back_edge(dom, *p, x) {
+                stack.push(*p);
+            }
+        }
+    }
+    fwd.intersection(&back).copied().collect()
+}
 pub fn blocks_between(cfg: &Cfg, from: BlockId, to: BlockId) -> HashSet<BlockId> {
     let mut fwd = HashSet::new();
     let mut stack = vec![from];

@@ -93,12 +93,7 @@ impl FuncPass for InlineDcePass {
             dce: self.dce,
             simplify: false,
         };
-        // Depth-gate the CFG order guard once per call (not per round):
-        // iterative dataflow cost scales with nesting depth. Deep dispatch
-        // scaffolding (f2422: ~990) keeps the old positional guard and its
-        // old speed; everything else gets dominance.
-        let cfg_guard = nesting_depth(&f.body) <= CFG_DEPTH_LIMIT;
-        inline_and_dce(&mut f.body, &opt, &mut ctx.aliases, cfg_guard)
+        inline_and_dce(&mut f.body, &opt, &mut ctx.aliases)
     }
 }
 
@@ -1002,10 +997,8 @@ fn order_ok_seq(
 
 /// Dominance order check for bodies with control flow: the single def
 /// block dominates the single use block, and no rep-var def sits on any
-/// def→use path (endpoints excluded, as in the seq check).
-/// Bitset doms + early-exit `has_def_between` (no per-candidate HashSet
-/// DFS + intersection); skips walks entirely when the expr mentions no
-/// vars or no rep defs exist outside the endpoints.
+/// acyclic def→use path (endpoints excluded, as in the seq check).
+/// Skips walks entirely when the expr mentions no vars.
 fn cfg_order_ok(g: &cfg::Cfg, dom: &[Vec<u64>], dst: Var, expr: &Expr) -> bool {
     let (Some(d), Some(u)) = (
         g.def_blocks.get(&dst).and_then(|v| match v[..] {
@@ -1027,58 +1020,17 @@ fn cfg_order_ok(g: &cfg::Cfg, dom: &[Vec<u64>], dst: Var, expr: &Expr) -> bool {
     if reps.is_empty() {
         return true;
     }
-    let mut rep_blocks: Vec<cfg::BlockId> = Vec::new();
-    for v in &reps {
-        if let Some(bs) = g.def_blocks.get(v) {
-            for &b in bs {
-                if b != d && b != u {
-                    rep_blocks.push(b);
-                }
-            }
-        }
-    }
-    if rep_blocks.is_empty() {
-        return true;
-    }
-    !cfg::has_def_between(g, d, u, &rep_blocks)
-}
-
-/// Max Block/Loop/If nesting for the CFG order guard. Deep dispatch
-/// scaffolding (f2422: ~4547) falls back to the positional check;
-/// bitset+RPO dataflow + dom reuse keep the CFG path cheap well past
-/// real-code depths (sqlite3 max 273 in yy_reduce, VdbeExec well under
-/// 100). 2000 covers all real functions with headroom while excluding
-/// pathological dispatch.
-const CFG_DEPTH_LIMIT: usize = 2000;
-
-/// Max Block/Loop/If nesting depth (early-out past the limit).
-fn nesting_depth(stmts: &[Stmt]) -> usize {
-    fn walk(stmts: &[Stmt], depth: usize, best: &mut usize) {
-        if depth > *best {
-            *best = depth;
-            if *best > CFG_DEPTH_LIMIT {
-                return;
-            }
-        }
-        for s in stmts {
-            match s {
-                Stmt::If { then_b, else_b, .. } => {
-                    walk(then_b, depth + 1, best);
-                    walk(else_b, depth + 1, best);
-                }
-                Stmt::Block { body, .. } | Stmt::Loop { body, .. } => {
-                    walk(body, depth + 1, best);
-                }
-                _ => {}
-            }
-            if *best > CFG_DEPTH_LIMIT {
-                return;
-            }
-        }
-    }
-    let mut best = 0;
-    walk(stmts, 0, &mut best);
-    best
+    // Loop-closing back-edges are ignored (see `is_back_edge`): a def
+    // reachable only by looping around executes after the use in
+    // iteration order. This restores same-iteration inlining (VM dispatch
+    // loops) that plain `blocks_between` rejects via cycle paths, while
+    // branch-skipped defs (the `bon` miscompile class) still refuse.
+    let between = cfg::blocks_between_acyclic(g, dom, d, u);
+    !reps.iter().any(|v| {
+        g.def_blocks.get(v).map_or(false, |bs| {
+            bs.iter().any(|&b| b != d && b != u && between.contains(&b))
+        })
+    })
 }
 
 /// True if the body contains any control-flow statement (ordering then
@@ -1091,12 +1043,7 @@ fn has_control_flow(stmts: &[Stmt]) -> bool {
     })
 }
 
-fn inline_and_dce(
-    stmts: &mut Vec<Stmt>,
-    opt: &OptConfig,
-    aliases: &mut AliasMap,
-    cfg_guard: bool,
-) -> bool {
+fn inline_and_dce(stmts: &mut Vec<Stmt>, opt: &OptConfig, aliases: &mut AliasMap) -> bool {
     let mut changed = false;
     // Batched inlining (perf): one map computation per round, one
     // substitution walk + one removal sweep for the whole batch — the old
@@ -1109,7 +1056,7 @@ fn inline_and_dce(
         // `has_control_flow` only sees top-level Block/Loop/If/Br, which
         // inline rounds never add/remove (subst touches exprs, sweep drops
         // only Assigns), so the decision is stable across rounds.
-        let want_cfg = cfg_guard && has_control_flow(stmts);
+        let want_cfg = has_control_flow(stmts);
         // Dominator cache: CFG topology is likewise invariant across inline
         // rounds, so the expensive dom survives; the cheap fingerprint
         // (O(n+e) per round) detects the impossible change and recomputes,

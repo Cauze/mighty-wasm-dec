@@ -28,22 +28,28 @@ New `src/cfg.rs` (public API):
 ## Phase B — CFG-driven passes (same output, stronger proof) [DONE]
 
 - Copyprop order guard reimplemented on dominance: def-block dominates
-  use-block + no rep-var def in `blocks_between` (endpoints excluded,
-  matching seq semantics). Straight-line bodies keep the positional
-  check (exact, free).
-- Scale story (perf subagent, see below): bitset+RPO dominators
-  (~1000× on f2422's dom: >120s → 93ms), dom reuse across inline
-  rounds via topology fingerprint, per-candidate walks replaced by
-  `has_def_between` with fast-path skips, lazy seq maps. Gate is now
-  2000, not 256: f2422 (4547 deep) stays seq, everything else
-  (sqlite3 max 273) takes CFG. Full sqlite3 module: 32.5s → 1.17s.
-  Gate NOT removed: seq/CFG legitimately disagree on monsters
-  (f2422 CFG output diverges ~57k lines — conservative tmp-keeping
-  either way), so 2000 keeps all baselines identical with headroom.
+  use-block + no rep-var def on any acyclic def→use path (endpoints
+  excluded, matching seq semantics). Straight-line bodies keep the
+  positional check (exact, free).
+- Iteration order matters: the first cut used cyclic `blocks_between`
+  and diverged ~57k lines on f2422 (loop-around paths made every
+  loop-carried rep look stale). Excluding loop-closing back-edges
+  (`is_back_edge`: head dominates tail) restored same-iteration
+  inlining — f2422 is byte-identical to the seq guard either way —
+  while branch-skipped defs (the `bon` miscompile class) still refuse
+  via dominance failure. No depth gate remains.
+- Scale story (perf subagent, then refined): bitset+RPO dominators
+  (f2422's dom: >120s → 93ms), dom reuse across inline rounds via
+  topology fingerprint, per-candidate walks replaced by
+  `blocks_between_acyclic` with fast-path skips, lazy seq maps.
+  f2422 scoped: 0.4s, 13,971 dispatch cases intact. Full sqlite3
+  module: 32.5s → 1.17s. `cfgdump` got the 512MB-stack treatment
+  after overflowing on f2422.
 - Differential result: `bon` (genuine miscompile fixed:
   branch-skipped def no longer inlined into the join),
   `recursion/fib` (converged identical after teaching the CFG that
-  `tee`-residue self-copies aren't defs).
+  `tee`-residue self-copies aren't defs), full `sqlite3` kept-tmp
+  decls 1702 → 310 with struct-hint count unchanged.
 - DEFERRED: transitive inline composition (chain cliff stays),
   cross-branch DCE. Both need the fixpoint-behavior review this
   phase didn't have room for.
