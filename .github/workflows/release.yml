@@ -1,0 +1,41 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin: mighty-wasm-dec
+            asset: mighty-wasm-dec-linux
+          - os: windows-latest
+            bin: mighty-wasm-dec.exe
+            asset: mighty-wasm-dec-windows.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Cargo.toml version matches tag
+        shell: bash
+        run: |
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          TAG=${GITHUB_REF#refs/tags/v}
+          test "$VER" = "$TAG" || { echo "Cargo.toml version $VER != tag $TAG"; exit 1; }
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Stage asset
+        shell: bash
+        run: cp "target/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
